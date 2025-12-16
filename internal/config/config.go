@@ -8,10 +8,26 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+)
+
+// LoadBalance strategy constants
+const (
+	LoadBalanceLeastLatency     = "least-latency"
+	LoadBalanceRoundRobin       = "round-robin"
+	LoadBalanceRandom           = "random"
+	LoadBalanceLeastConnections = "least-connections"
+)
+
+// LoadBalanceSort type constants
+const (
+	LoadBalanceSortUDP  = "udp"
+	LoadBalanceSortTCP  = "tcp"
+	LoadBalanceSortHTTP = "http"
 )
 
 // ServerConfig represents a proxy target server configuration.
@@ -33,8 +49,10 @@ type ServerConfig struct {
 	ProxyMode       string `json:"proxy_mode"`        // "transparent" (default) or "raknet" (full RakNet proxy)
 	XboxAuthEnabled bool   `json:"xbox_auth_enabled"` // Enable Xbox Live authentication for remote connections
 	XboxTokenPath   string `json:"xbox_token_path"`   // Custom token file path for Xbox Live tokens (optional)
-	ProxyOutbound   string `json:"proxy_outbound"`    // Proxy outbound node name, empty or "direct" for direct connection
+	ProxyOutbound   string `json:"proxy_outbound"`    // Proxy outbound node name, "@group" for group selection, empty or "direct" for direct connection
 	ShowRealLatency bool   `json:"show_real_latency"` // Show real latency through proxy in server list ping
+	LoadBalance     string `json:"load_balance"`      // Load balance strategy: least-latency, round-robin, random, least-connections
+	LoadBalanceSort string `json:"load_balance_sort"` // Latency sort type: udp, tcp, http
 	resolvedIP      string
 	lastResolved    time.Time
 }
@@ -129,8 +147,10 @@ type ServerConfigDTO struct {
 	ProxyMode       string `json:"proxy_mode"` // "transparent", "passthrough", or "raknet"
 	XboxAuthEnabled bool   `json:"xbox_auth_enabled"`
 	XboxTokenPath   string `json:"xbox_token_path"`
-	ProxyOutbound   string `json:"proxy_outbound"`    // Proxy outbound node name
+	ProxyOutbound   string `json:"proxy_outbound"`    // Proxy outbound node name or "@group" for group selection
 	ShowRealLatency bool   `json:"show_real_latency"` // Show real latency through proxy
+	LoadBalance     string `json:"load_balance"`      // Load balance strategy
+	LoadBalanceSort string `json:"load_balance_sort"` // Latency sort type
 	Status          string `json:"status"`            // running, stopped
 	ActiveSessions  int    `json:"active_sessions"`
 }
@@ -157,6 +177,8 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		XboxTokenPath:   sc.XboxTokenPath,
 		ProxyOutbound:   sc.ProxyOutbound,
 		ShowRealLatency: sc.ShowRealLatency,
+		LoadBalance:     sc.LoadBalance,
+		LoadBalanceSort: sc.LoadBalanceSort,
 		Status:          status,
 		ActiveSessions:  activeSessions,
 	}
@@ -212,6 +234,64 @@ func (sc *ServerConfig) GetProxyOutbound() string {
 // This is the case when ProxyOutbound is empty or "direct".
 func (sc *ServerConfig) IsDirectConnection() bool {
 	return sc.ProxyOutbound == "" || sc.ProxyOutbound == "direct"
+}
+
+// IsGroupSelection returns true if the proxy_outbound specifies a group (starts with "@").
+func (sc *ServerConfig) IsGroupSelection() bool {
+	return strings.HasPrefix(sc.ProxyOutbound, "@")
+}
+
+// IsMultiNodeSelection returns true if the proxy_outbound specifies multiple nodes (comma-separated).
+func (sc *ServerConfig) IsMultiNodeSelection() bool {
+	if sc.ProxyOutbound == "" || sc.ProxyOutbound == "direct" {
+		return false
+	}
+	if strings.HasPrefix(sc.ProxyOutbound, "@") {
+		return false
+	}
+	return strings.Contains(sc.ProxyOutbound, ",")
+}
+
+// GetNodeList returns the list of node names from proxy_outbound.
+// Returns nil if not a multi-node selection.
+func (sc *ServerConfig) GetNodeList() []string {
+	if !sc.IsMultiNodeSelection() {
+		return nil
+	}
+	nodes := strings.Split(sc.ProxyOutbound, ",")
+	result := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		trimmed := strings.TrimSpace(node)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+// GetGroupName returns the group name without the "@" prefix.
+// Returns empty string if not a group selection.
+func (sc *ServerConfig) GetGroupName() string {
+	if sc.IsGroupSelection() {
+		return strings.TrimPrefix(sc.ProxyOutbound, "@")
+	}
+	return ""
+}
+
+// GetLoadBalance returns the load balance strategy, defaulting to "least-latency".
+func (sc *ServerConfig) GetLoadBalance() string {
+	if sc.LoadBalance == "" {
+		return LoadBalanceLeastLatency
+	}
+	return sc.LoadBalance
+}
+
+// GetLoadBalanceSort returns the latency sort type, defaulting to "udp".
+func (sc *ServerConfig) GetLoadBalanceSort() string {
+	if sc.LoadBalanceSort == "" {
+		return LoadBalanceSortUDP
+	}
+	return sc.LoadBalanceSort
 }
 
 // DNSResolver handles DNS resolution for server targets.

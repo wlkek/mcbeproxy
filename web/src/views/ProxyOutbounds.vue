@@ -18,18 +18,82 @@
       </n-space>
     </n-space>
     
+    <!-- 分组卡片 -->
+    <div class="group-cards-container" v-if="groupStatsData.length > 0">
+      <!-- 全部节点卡片 -->
+      <n-card 
+        size="small"
+        class="group-card-wrapper" 
+        :class="{ selected: selectedGroup === null }"
+        @click="selectedGroup = null"
+        hoverable
+      >
+        <div class="group-card-header">
+          <span class="group-name">全部</span>
+          <span class="health-indicator health-green"></span>
+        </div>
+        <div class="group-card-body">
+          <div class="group-stat">
+            <span class="stat-label">节点</span>
+            <span class="stat-value">{{ totalStats.healthy }}/{{ totalStats.total }}</span>
+          </div>
+          <div class="group-stat">
+            <span class="stat-label">UDP</span>
+            <span class="stat-value" :class="{ 'udp-available': totalStats.udp > 0 }">
+              {{ totalStats.udp > 0 ? totalStats.udp + '可用' : '不可用' }}
+            </span>
+          </div>
+        </div>
+      </n-card>
+
+      <!-- 分组卡片 -->
+      <n-card 
+        v-for="group in groupStatsData" 
+        :key="group.name || '_ungrouped'" 
+        size="small"
+        class="group-card-wrapper"
+        :class="{ selected: selectedGroup === (group.name || '') }"
+        @click="selectedGroup = group.name || ''"
+        hoverable
+      >
+        <div class="group-card-header">
+          <span class="group-name">{{ group.name || '未分组' }}</span>
+          <span 
+            class="health-indicator" 
+            :class="getGroupHealthClass(group)"
+          ></span>
+        </div>
+        <div class="group-card-body">
+          <div class="group-stat">
+            <span class="stat-label">节点</span>
+            <span class="stat-value">{{ group.healthy_count }}/{{ group.total_count }}</span>
+          </div>
+          <div class="group-stat">
+            <span class="stat-label">UDP</span>
+            <span class="stat-value" :class="{ 'udp-available': group.udp_available > 0 }">
+              {{ group.udp_available > 0 ? group.udp_available + '可用' : '不可用' }}
+            </span>
+          </div>
+          <div class="group-stat">
+            <span class="stat-label">最低</span>
+            <span class="stat-value" :class="getLatencyClass(group.min_udp_latency_ms || group.min_tcp_latency_ms)">
+              {{ formatLatency(group.min_udp_latency_ms || group.min_tcp_latency_ms) }}
+            </span>
+          </div>
+          <div class="group-stat">
+            <span class="stat-label">平均</span>
+            <span class="stat-value" :class="getLatencyClass(group.avg_udp_latency_ms || group.avg_tcp_latency_ms)">
+              {{ formatLatency(group.avg_udp_latency_ms || group.avg_tcp_latency_ms) }}
+            </span>
+          </div>
+        </div>
+      </n-card>
+    </div>
+
     <!-- 分组筛选 -->
     <n-card size="small" style="margin-bottom: 16px">
-      <n-space align="center">
-        <span>分组:</span>
-        <n-select 
-          v-model:value="selectedGroup" 
-          :options="groupOptions" 
-          style="width: 200px" 
-          placeholder="全部节点"
-          clearable
-        />
-        <span style="margin-left: 16px">协议:</span>
+      <n-space align="center" wrap>
+        <span>协议:</span>
         <n-select 
           v-model:value="selectedProtocol" 
           :options="protocolFilterOptions" 
@@ -401,7 +465,8 @@ import { NTag, NButton, NSpace, NPopconfirm, useMessage } from 'naive-ui'
 import { api } from '../api'
 
 const props = defineProps({
-  initialSearch: { type: String, default: '' }
+  initialSearch: { type: String, default: '' },
+  initialHighlight: { type: String, default: '' }
 })
 
 const message = useMessage()
@@ -430,6 +495,54 @@ const selectedGroup = ref(null)
 const selectedProtocol = ref(null)
 const selectedStatus = ref(null)
 const searchKeyword = ref('')
+
+// 分组统计数据
+const groupStatsData = ref([])
+
+// 获取分组统计
+const fetchGroupStats = async () => {
+  try {
+    const res = await api('/api/proxy-outbounds/groups')
+    if (res.success && res.data) {
+      groupStatsData.value = res.data
+    }
+  } catch (e) {
+    console.error('Failed to fetch group stats:', e)
+  }
+}
+
+// 总计统计
+const totalStats = computed(() => {
+  let total = 0, healthy = 0, udp = 0
+  groupStatsData.value.forEach(g => {
+    total += g.total_count || 0
+    healthy += g.healthy_count || 0
+    udp += g.udp_available || 0
+  })
+  return { total, healthy, udp }
+})
+
+// 获取分组健康状态样式类
+const getGroupHealthClass = (group) => {
+  if (group.total_count === 0) return 'health-gray'
+  if (group.healthy_count === group.total_count) return 'health-green'
+  if (group.healthy_count === 0) return 'health-red'
+  return 'health-yellow'
+}
+
+// 获取延迟样式类
+const getLatencyClass = (latency) => {
+  if (!latency || latency <= 0) return ''
+  if (latency < 100) return 'latency-good'
+  if (latency < 300) return 'latency-medium'
+  return 'latency-bad'
+}
+
+// 格式化延迟
+const formatLatency = (latency) => {
+  if (!latency || latency <= 0) return '-'
+  return `${latency}ms`
+}
 
 // 分组选项（从数据中动态生成）
 const groupOptions = computed(() => {
@@ -470,9 +583,14 @@ const statusFilterOptions = [
 const filteredOutbounds = computed(() => {
   let result = [...outbounds.value]
   
-  // 分组筛选
-  if (selectedGroup.value) {
-    result = result.filter(o => o.group === selectedGroup.value)
+  // 分组筛选 - 支持空字符串表示未分组
+  if (selectedGroup.value !== null) {
+    if (selectedGroup.value === '') {
+      // 未分组节点
+      result = result.filter(o => !o.group)
+    } else {
+      result = result.filter(o => o.group === selectedGroup.value)
+    }
   }
   
   // 协议筛选
@@ -508,8 +626,13 @@ const filteredOutbounds = computed(() => {
     )
   }
   
-  // 排序：先按分组（无分组在前），再按名称
+  // 排序：高亮节点在最前，然后按分组（无分组在前），再按名称
   return result.sort((a, b) => {
+    // 高亮节点排在最前面
+    if (highlightName.value) {
+      if (a.name === highlightName.value) return -1
+      if (b.name === highlightName.value) return 1
+    }
     // 分组排序：无分组在前
     if (!a.group && b.group) return -1
     if (a.group && !b.group) return 1
@@ -1411,19 +1534,22 @@ const importNodes = async () => {
 }
 
 onMounted(async () => {
-  await load()
-  if (props.initialSearch) {
-    highlightName.value = props.initialSearch
-    // 3秒后取消高亮
-    setTimeout(() => { highlightName.value = '' }, 3000)
+  await Promise.all([load(), fetchGroupStats()])
+  // 优先使用 initialHighlight，否则使用 initialSearch
+  const highlightTarget = props.initialHighlight || props.initialSearch
+  if (highlightTarget) {
+    highlightName.value = highlightTarget
+    // 5秒后取消高亮（但保持排序）
+    setTimeout(() => { highlightName.value = '' }, 5000)
   }
 })
 
-// 监听 initialSearch 变化
-watch(() => props.initialSearch, (newVal) => {
-  if (newVal) {
-    highlightName.value = newVal
-    setTimeout(() => { highlightName.value = '' }, 3000)
+// 监听 initialSearch 和 initialHighlight 变化
+watch([() => props.initialSearch, () => props.initialHighlight], ([search, highlight]) => {
+  const target = highlight || search
+  if (target) {
+    highlightName.value = target
+    setTimeout(() => { highlightName.value = '' }, 5000)
   }
 })
 </script>
@@ -1451,5 +1577,126 @@ watch(() => props.initialSearch, (newVal) => {
 .html-preview img {
   max-width: 100%;
   height: auto;
+}
+
+/* 分组卡片容器 */
+.group-cards-container {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 4px;
+}
+
+/* 分组卡片包装器 (n-card) */
+.group-card-wrapper {
+  width: 180px;
+  border-radius: 8px !important;
+  transition: all 0.2s ease;
+  cursor: pointer;
+}
+
+/* 选中状态 - 使用主题色 */
+.group-card-wrapper.selected {
+  border-color: var(--n-primary-color) !important;
+  background: rgba(24, 160, 88, 0.12) !important;
+  box-shadow: 0 0 0 2px rgba(24, 160, 88, 0.25);
+}
+
+.group-card-wrapper.selected .group-name {
+  color: var(--n-primary-color);
+}
+
+.group-card-wrapper.selected:hover {
+  border-color: var(--n-primary-color-hover) !important;
+  background: rgba(24, 160, 88, 0.18) !important;
+}
+
+/* 卡片头部 */
+.group-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--n-border-color);
+}
+
+.group-name {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--n-text-color-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 110px;
+}
+
+/* 健康指示器 */
+.health-indicator {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.health-green {
+  background-color: #22c55e;
+  box-shadow: 0 0 4px #22c55e;
+}
+
+.health-yellow {
+  background-color: #eab308;
+  box-shadow: 0 0 4px #eab308;
+}
+
+.health-red {
+  background-color: #ef4444;
+  box-shadow: 0 0 4px #ef4444;
+}
+
+.health-gray {
+  background-color: #9ca3af;
+}
+
+/* 卡片内容 */
+.group-card-body {
+  padding: 10px 12px;
+}
+
+.group-stat {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.group-stat:last-child {
+  margin-bottom: 0;
+}
+
+.stat-label {
+  color: var(--n-text-color-3);
+}
+
+.stat-value {
+  font-weight: 500;
+  color: var(--n-text-color-2);
+}
+
+.stat-value.udp-available {
+  color: #22c55e;
+}
+
+.stat-value.latency-good {
+  color: #22c55e;
+}
+
+.stat-value.latency-medium {
+  color: #eab308;
+}
+
+.stat-value.latency-bad {
+  color: #ef4444;
 }
 </style>

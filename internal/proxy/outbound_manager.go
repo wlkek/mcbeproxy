@@ -15,10 +15,13 @@ import (
 
 // Error definitions for OutboundManager operations.
 var (
-	ErrOutboundNotFound  = errors.New("proxy outbound not found")
-	ErrOutboundExists    = errors.New("proxy outbound already exists")
-	ErrOutboundUnhealthy = errors.New("proxy outbound is unhealthy")
-	ErrAllRetriesFailed  = errors.New("all retry attempts failed")
+	ErrOutboundNotFound   = errors.New("proxy outbound not found")
+	ErrOutboundExists     = errors.New("proxy outbound already exists")
+	ErrOutboundUnhealthy  = errors.New("proxy outbound is unhealthy")
+	ErrAllRetriesFailed   = errors.New("all retry attempts failed")
+	ErrGroupNotFound      = errors.New("proxy group not found")
+	ErrNoHealthyNodes     = errors.New("no healthy nodes available")
+	ErrAllFailoversFailed = errors.New("all failover attempts failed")
 )
 
 // Retry configuration constants
@@ -37,6 +40,21 @@ type HealthStatus struct {
 	LastCheck time.Time     `json:"last_check"`
 	ConnCount int64         `json:"conn_count"`
 	LastError string        `json:"last_error,omitempty"`
+}
+
+// GroupStats represents statistics for a proxy outbound group.
+// Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 8.4
+type GroupStats struct {
+	Name           string `json:"name"`                // Group name (empty string for ungrouped nodes)
+	TotalCount     int    `json:"total_count"`         // Total node count
+	HealthyCount   int    `json:"healthy_count"`       // Healthy node count
+	UDPAvailable   int    `json:"udp_available"`       // UDP available node count
+	AvgTCPLatency  int64  `json:"avg_tcp_latency_ms"`  // Average TCP latency in milliseconds
+	AvgUDPLatency  int64  `json:"avg_udp_latency_ms"`  // Average UDP latency in milliseconds
+	AvgHTTPLatency int64  `json:"avg_http_latency_ms"` // Average HTTP latency in milliseconds
+	MinTCPLatency  int64  `json:"min_tcp_latency_ms"`  // Minimum TCP latency in milliseconds
+	MinUDPLatency  int64  `json:"min_udp_latency_ms"`  // Minimum UDP latency in milliseconds
+	MinHTTPLatency int64  `json:"min_http_latency_ms"` // Minimum HTTP latency in milliseconds
 }
 
 // OutboundManager defines the interface for managing proxy outbound nodes.
@@ -95,6 +113,34 @@ type OutboundManager interface {
 
 	// GetActiveConnectionCount returns the total number of active connections across all outbounds.
 	GetActiveConnectionCount() int64
+
+	// GetGroupStats returns statistics for a specific group.
+	// Returns nil if the group has no nodes.
+	// Requirements: 4.1, 4.2, 4.3, 4.4, 4.5
+	GetGroupStats(groupName string) *GroupStats
+
+	// ListGroups returns statistics for all groups including ungrouped nodes.
+	// Ungrouped nodes are returned with an empty group name.
+	// Requirements: 8.4
+	ListGroups() []*GroupStats
+
+	// GetOutboundsByGroup returns all outbounds in a specific group.
+	// Returns empty slice if the group has no nodes.
+	GetOutboundsByGroup(groupName string) []*config.ProxyOutbound
+
+	// SelectOutbound selects a healthy proxy outbound based on the specified strategy.
+	// groupOrName: node name or "@groupName" for group selection
+	// strategy: load balance strategy (least-latency, round-robin, random, least-connections)
+	// sortBy: latency sort type (udp, tcp, http)
+	// Returns the selected outbound or error if no healthy nodes available.
+	// Requirements: 3.1, 3.3, 3.4
+	SelectOutbound(groupOrName, strategy, sortBy string) (*config.ProxyOutbound, error)
+
+	// SelectOutboundWithFailover selects a healthy proxy outbound with failover support.
+	// excludeNodes: list of node names to exclude (for failover after connection failure)
+	// Returns the selected outbound or error if all nodes exhausted.
+	// Requirements: 3.1, 3.4
+	SelectOutboundWithFailover(groupOrName, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error)
 }
 
 // ServerConfigUpdater is an interface for updating server configurations.
@@ -750,4 +796,355 @@ func (m *outboundManagerImpl) GetActiveConnectionCount() int64 {
 		total += cfg.GetConnCount()
 	}
 	return total
+}
+
+// GetOutboundsByGroup returns all outbounds in a specific group.
+// Returns empty slice if the group has no nodes.
+func (m *outboundManagerImpl) GetOutboundsByGroup(groupName string) []*config.ProxyOutbound {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var result []*config.ProxyOutbound
+	for _, outbound := range m.outbounds {
+		if outbound.Group == groupName {
+			result = append(result, outbound.Clone())
+		}
+	}
+	return result
+}
+
+// GetGroupStats returns statistics for a specific group.
+// Returns nil if the group has no nodes.
+// Requirements: 4.1, 4.2, 4.3, 4.4, 4.5
+func (m *outboundManagerImpl) GetGroupStats(groupName string) *GroupStats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.calculateGroupStats(groupName)
+}
+
+// ListGroups returns statistics for all groups including ungrouped nodes.
+// Ungrouped nodes are returned with an empty group name.
+// Requirements: 8.4
+func (m *outboundManagerImpl) ListGroups() []*GroupStats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Collect all unique group names
+	groupNames := make(map[string]bool)
+	for _, outbound := range m.outbounds {
+		groupNames[outbound.Group] = true
+	}
+
+	// Calculate stats for each group
+	var result []*GroupStats
+	for groupName := range groupNames {
+		stats := m.calculateGroupStats(groupName)
+		if stats != nil {
+			result = append(result, stats)
+		}
+	}
+
+	return result
+}
+
+// calculateGroupStats calculates statistics for a specific group.
+// Must be called with read lock held.
+func (m *outboundManagerImpl) calculateGroupStats(groupName string) *GroupStats {
+	var nodes []*config.ProxyOutbound
+	for _, outbound := range m.outbounds {
+		if outbound.Group == groupName {
+			nodes = append(nodes, outbound)
+		}
+	}
+
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	stats := &GroupStats{
+		Name:           groupName,
+		TotalCount:     len(nodes),
+		MinTCPLatency:  -1, // Use -1 to indicate no value yet
+		MinUDPLatency:  -1,
+		MinHTTPLatency: -1,
+	}
+
+	var totalTCPLatency, totalUDPLatency, totalHTTPLatency int64
+	var tcpCount, udpCount, httpCount int
+
+	for _, node := range nodes {
+		// Count healthy nodes
+		if node.GetHealthy() {
+			stats.HealthyCount++
+		}
+
+		// Count UDP available nodes
+		if node.UDPAvailable != nil && *node.UDPAvailable {
+			stats.UDPAvailable++
+		}
+
+		// Calculate TCP latency stats
+		if node.TCPLatencyMs > 0 {
+			totalTCPLatency += node.TCPLatencyMs
+			tcpCount++
+			if stats.MinTCPLatency < 0 || node.TCPLatencyMs < stats.MinTCPLatency {
+				stats.MinTCPLatency = node.TCPLatencyMs
+			}
+		}
+
+		// Calculate UDP latency stats
+		if node.UDPLatencyMs > 0 {
+			totalUDPLatency += node.UDPLatencyMs
+			udpCount++
+			if stats.MinUDPLatency < 0 || node.UDPLatencyMs < stats.MinUDPLatency {
+				stats.MinUDPLatency = node.UDPLatencyMs
+			}
+		}
+
+		// Calculate HTTP latency stats
+		if node.HTTPLatencyMs > 0 {
+			totalHTTPLatency += node.HTTPLatencyMs
+			httpCount++
+			if stats.MinHTTPLatency < 0 || node.HTTPLatencyMs < stats.MinHTTPLatency {
+				stats.MinHTTPLatency = node.HTTPLatencyMs
+			}
+		}
+	}
+
+	// Calculate averages
+	if tcpCount > 0 {
+		stats.AvgTCPLatency = totalTCPLatency / int64(tcpCount)
+	}
+	if udpCount > 0 {
+		stats.AvgUDPLatency = totalUDPLatency / int64(udpCount)
+	}
+	if httpCount > 0 {
+		stats.AvgHTTPLatency = totalHTTPLatency / int64(httpCount)
+	}
+
+	// Reset -1 values to 0 for JSON output
+	if stats.MinTCPLatency < 0 {
+		stats.MinTCPLatency = 0
+	}
+	if stats.MinUDPLatency < 0 {
+		stats.MinUDPLatency = 0
+	}
+	if stats.MinHTTPLatency < 0 {
+		stats.MinHTTPLatency = 0
+	}
+
+	return stats
+}
+
+// loadBalancer is a shared LoadBalancer instance for the OutboundManager.
+var loadBalancer = NewLoadBalancer()
+
+// SelectOutbound selects a healthy proxy outbound based on the specified strategy.
+// groupOrName: node name or "@groupName" for group selection
+// strategy: load balance strategy (least-latency, round-robin, random, least-connections)
+// sortBy: latency sort type (udp, tcp, http)
+// Returns the selected outbound or error if no healthy nodes available.
+// Requirements: 3.1, 3.3, 3.4
+func (m *outboundManagerImpl) SelectOutbound(groupOrName, strategy, sortBy string) (*config.ProxyOutbound, error) {
+	return m.SelectOutboundWithFailover(groupOrName, strategy, sortBy, nil)
+}
+
+// SelectOutboundWithFailover selects a healthy proxy outbound with failover support.
+// excludeNodes: list of node names to exclude (for failover after connection failure)
+// Returns the selected outbound or error if all nodes exhausted.
+// Requirements: 3.1, 3.4
+func (m *outboundManagerImpl) SelectOutboundWithFailover(groupOrName, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Check if it's a group selection (starts with "@")
+	if strings.HasPrefix(groupOrName, "@") {
+		groupName := strings.TrimPrefix(groupOrName, "@")
+		return m.selectFromGroup(groupName, strategy, sortBy, excludeNodes)
+	}
+
+	// Check if it's a multi-node selection (comma-separated)
+	if strings.Contains(groupOrName, ",") {
+		return m.selectFromNodeList(groupOrName, strategy, sortBy, excludeNodes)
+	}
+
+	// Single node selection
+	return m.selectSingleNode(groupOrName, excludeNodes)
+}
+
+// selectFromNodeList selects a healthy node from a comma-separated list of node names.
+// Must be called with read lock held.
+func (m *outboundManagerImpl) selectFromNodeList(nodeListStr, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error) {
+	// Parse the comma-separated node list
+	nodeNames := strings.Split(nodeListStr, ",")
+
+	// Build exclusion set for O(1) lookup
+	excludeSet := make(map[string]bool)
+	for _, name := range excludeNodes {
+		excludeSet[name] = true
+	}
+
+	// Collect healthy nodes from the specified list
+	var healthyNodes []*config.ProxyOutbound
+	var notFoundNodes []string
+
+	for _, nodeName := range nodeNames {
+		nodeName = strings.TrimSpace(nodeName)
+		if nodeName == "" {
+			continue
+		}
+
+		// Skip excluded nodes (for failover)
+		if excludeSet[nodeName] {
+			continue
+		}
+
+		outbound, exists := m.outbounds[nodeName]
+		if !exists {
+			notFoundNodes = append(notFoundNodes, nodeName)
+			continue
+		}
+
+		// Skip disabled nodes
+		if !outbound.Enabled {
+			continue
+		}
+
+		// Skip unhealthy nodes only if they have been tested and failed recently
+		// Allow retry after 30 seconds to recover from transient issues
+		lastCheck := outbound.GetLastCheck()
+		isNeverTested := lastCheck.IsZero()
+		hasError := outbound.GetLastError() != ""
+		isHealthy := outbound.GetHealthy()
+		timeSinceLastCheck := time.Since(lastCheck)
+
+		// Allow node if:
+		// - healthy
+		// - never tested
+		// - no error recorded
+		// - unhealthy but last check was more than 30 seconds ago (allow retry)
+		if !isHealthy && !isNeverTested && hasError && timeSinceLastCheck < 30*time.Second {
+			continue
+		}
+
+		healthyNodes = append(healthyNodes, outbound)
+	}
+
+	// Check if there are any healthy nodes
+	if len(healthyNodes) == 0 {
+		if len(notFoundNodes) > 0 {
+			return nil, fmt.Errorf("%w: nodes not found: %v", ErrOutboundNotFound, notFoundNodes)
+		}
+		if len(excludeNodes) > 0 {
+			return nil, fmt.Errorf("%w: all specified nodes have been tried", ErrAllFailoversFailed)
+		}
+		return nil, fmt.Errorf("%w: in specified node list", ErrNoHealthyNodes)
+	}
+
+	// Use load balancer to select a node
+	// Use a virtual group name based on the node list for round-robin state tracking
+	virtualGroupName := "nodelist:" + nodeListStr
+	selected := loadBalancer.Select(healthyNodes, strategy, sortBy, virtualGroupName)
+	if selected == nil {
+		return nil, fmt.Errorf("%w: in specified node list", ErrNoHealthyNodes)
+	}
+
+	return selected.Clone(), nil
+}
+
+// selectFromGroup selects a healthy node from a group.
+// Must be called with read lock held.
+func (m *outboundManagerImpl) selectFromGroup(groupName, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error) {
+	// Build exclusion set for O(1) lookup
+	excludeSet := make(map[string]bool)
+	for _, name := range excludeNodes {
+		excludeSet[name] = true
+	}
+
+	// Collect healthy nodes from the group, excluding specified nodes
+	var healthyNodes []*config.ProxyOutbound
+	var groupExists bool
+
+	for _, outbound := range m.outbounds {
+		if outbound.Group == groupName {
+			groupExists = true
+
+			// Skip excluded nodes (for failover)
+			if excludeSet[outbound.Name] {
+				continue
+			}
+
+			// Skip disabled nodes
+			if !outbound.Enabled {
+				continue
+			}
+
+			// Skip unhealthy nodes only if they failed recently
+			// Allow retry after 30 seconds to recover from transient issues
+			// Requirements: 3.4 - exclude unhealthy nodes from selection
+			lastCheck := outbound.GetLastCheck()
+			hasError := outbound.GetLastError() != ""
+			isHealthy := outbound.GetHealthy()
+			timeSinceLastCheck := time.Since(lastCheck)
+
+			if !isHealthy && hasError && !lastCheck.IsZero() && timeSinceLastCheck < 30*time.Second {
+				continue
+			}
+
+			healthyNodes = append(healthyNodes, outbound)
+		}
+	}
+
+	// Check if group exists
+	if !groupExists {
+		return nil, fmt.Errorf("%w: '@%s'", ErrGroupNotFound, groupName)
+	}
+
+	// Check if there are any healthy nodes
+	// Requirements: 3.3 - return error when all nodes are unhealthy
+	if len(healthyNodes) == 0 {
+		if len(excludeNodes) > 0 {
+			return nil, fmt.Errorf("%w: all nodes in group '@%s' have been tried", ErrAllFailoversFailed, groupName)
+		}
+		return nil, fmt.Errorf("%w: in group '@%s'", ErrNoHealthyNodes, groupName)
+	}
+
+	// Use load balancer to select a node
+	selected := loadBalancer.Select(healthyNodes, strategy, sortBy, groupName)
+	if selected == nil {
+		return nil, fmt.Errorf("%w: in group '@%s'", ErrNoHealthyNodes, groupName)
+	}
+
+	return selected.Clone(), nil
+}
+
+// selectSingleNode selects a specific node by name.
+// Must be called with read lock held.
+func (m *outboundManagerImpl) selectSingleNode(nodeName string, excludeNodes []string) (*config.ProxyOutbound, error) {
+	// Check if node is in exclusion list (for failover scenarios)
+	for _, excluded := range excludeNodes {
+		if excluded == nodeName {
+			return nil, fmt.Errorf("%w: '%s' has already been tried", ErrAllFailoversFailed, nodeName)
+		}
+	}
+
+	// Find the node
+	outbound, exists := m.outbounds[nodeName]
+	if !exists {
+		return nil, fmt.Errorf("%w: '%s'", ErrOutboundNotFound, nodeName)
+	}
+
+	// Check if node is enabled
+	if !outbound.Enabled {
+		return nil, fmt.Errorf("outbound '%s' is disabled", nodeName)
+	}
+
+	// Check if node is healthy
+	// Requirements: 3.4 - exclude unhealthy nodes from selection
+	if !outbound.GetHealthy() && outbound.GetLastError() != "" {
+		return nil, fmt.Errorf("%w: '%s' - %s", ErrOutboundUnhealthy, nodeName, outbound.GetLastError())
+	}
+
+	return outbound.Clone(), nil
 }

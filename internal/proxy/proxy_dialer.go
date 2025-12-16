@@ -15,21 +15,44 @@ import (
 
 // ProxyDialer implements a custom dialer that routes connections through OutboundManager.
 // It implements the interface needed by go-raknet's Dialer.UpstreamDialer.
-// Requirements: 2.1, 2.2, 2.3, 2.4
+// Supports load balancing and failover for group selections.
+// Requirements: 2.1, 2.2, 2.3, 2.4, 3.1, 3.2
 type ProxyDialer struct {
-	outboundMgr  OutboundManager
-	serverConfig *config.ServerConfig
-	timeout      time.Duration
+	outboundMgr   OutboundManager
+	serverConfig  *config.ServerConfig
+	timeout       time.Duration
+	excludedNodes []string // Nodes to exclude during failover (already tried and failed)
+	selectedNode  string   // Currently selected node name (for logging)
+	mu            sync.Mutex
 }
 
 // NewProxyDialer creates a new ProxyDialer.
 // If outboundMgr is nil or serverConfig.ProxyOutbound is empty/"direct", it will use direct connections.
 func NewProxyDialer(outboundMgr OutboundManager, serverConfig *config.ServerConfig, timeout time.Duration) *ProxyDialer {
 	return &ProxyDialer{
-		outboundMgr:  outboundMgr,
-		serverConfig: serverConfig,
-		timeout:      timeout,
+		outboundMgr:   outboundMgr,
+		serverConfig:  serverConfig,
+		timeout:       timeout,
+		excludedNodes: nil,
+		selectedNode:  "",
 	}
+}
+
+// GetSelectedNode returns the name of the currently selected node.
+// This is useful for logging which node was actually used for the connection.
+func (d *ProxyDialer) GetSelectedNode() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.selectedNode
+}
+
+// ResetFailover clears the excluded nodes list, allowing all nodes to be tried again.
+// This should be called when starting a new connection attempt.
+func (d *ProxyDialer) ResetFailover() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.excludedNodes = nil
+	d.selectedNode = ""
 }
 
 // Dial creates a connection to the specified address.
@@ -45,8 +68,9 @@ func (d *ProxyDialer) Dial(network, address string) (net.Conn, error) {
 // DialContext creates a connection to the specified address with context.
 // If a proxy outbound is configured, it routes through the proxy.
 // Otherwise, it uses a direct connection.
+// Supports load balancing for group selections (@groupName) and automatic failover.
 // This method is required by raknet.UpstreamDialer interface.
-// Requirements: 2.1, 2.2, 2.4
+// Requirements: 2.1, 2.2, 2.4, 3.1, 3.2
 func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	// Check if we should use direct connection
 	// Requirements: 2.2
@@ -57,6 +81,18 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 	}
 
 	proxyOutbound := d.serverConfig.GetProxyOutbound()
+
+	// Check if this is a group selection (load balancing mode)
+	if d.serverConfig.IsGroupSelection() {
+		return d.dialWithLoadBalancing(ctx, network, address, proxyOutbound)
+	}
+
+	// Check if this is a multi-node selection (load balancing mode)
+	if d.serverConfig.IsMultiNodeSelection() {
+		return d.dialWithLoadBalancing(ctx, network, address, proxyOutbound)
+	}
+
+	// Single node mode - use direct outbound name
 	logger.Debug("ProxyDialer: Dialing %s via proxy outbound %s (network=%s)", address, proxyOutbound, network)
 
 	// Get PacketConn through the outbound manager
@@ -68,6 +104,11 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 		return dialer.DialContext(ctx, network, address)
 	}
 
+	// Track the selected node
+	d.mu.Lock()
+	d.selectedNode = proxyOutbound
+	d.mu.Unlock()
+
 	logger.Debug("ProxyDialer: PacketConn created successfully for %s via %s", address, proxyOutbound)
 
 	// Wrap PacketConn as a Conn for go-raknet compatibility
@@ -77,6 +118,102 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 		PacketConn: packetConn,
 		remoteAddr: remoteAddr,
 	}, nil
+}
+
+// dialWithLoadBalancing handles connection with load balancing and failover support.
+// It selects a node from the group based on the configured strategy and automatically
+// fails over to the next healthy node if connection fails.
+// Requirements: 3.1, 3.2
+func (d *ProxyDialer) dialWithLoadBalancing(ctx context.Context, network, address, groupSelector string) (net.Conn, error) {
+	strategy := d.serverConfig.GetLoadBalance()
+	sortBy := d.serverConfig.GetLoadBalanceSort()
+
+	d.mu.Lock()
+	excludedNodes := make([]string, len(d.excludedNodes))
+	copy(excludedNodes, d.excludedNodes)
+	d.mu.Unlock()
+
+	// Determine selector type for logging
+	selectorType := "group"
+	selectorDisplay := groupSelector
+	if strings.Contains(groupSelector, ",") {
+		selectorType = "node-list"
+		nodeCount := len(strings.Split(groupSelector, ","))
+		selectorDisplay = fmt.Sprintf("%d nodes", nodeCount)
+	}
+
+	logger.Debug("ProxyDialer: Load balancing for %s via %s %s (strategy=%s, sortBy=%s, excluded=%v)",
+		address, selectorType, selectorDisplay, strategy, sortBy, excludedNodes)
+
+	// Try to select and connect to a node, with failover on failure
+	for {
+		// Select a healthy node from the group
+		selectedOutbound, err := d.outboundMgr.SelectOutboundWithFailover(groupSelector, strategy, sortBy, excludedNodes)
+		if err != nil {
+			// No more healthy nodes available
+			// Requirements: 3.2 - Log failover event
+			if len(excludedNodes) > 0 {
+				logger.Warn("ProxyDialer: All failover attempts exhausted for %s %s (tried: %v): %v",
+					selectorType, selectorDisplay, excludedNodes, err)
+			} else {
+				logger.Warn("ProxyDialer: No healthy nodes available in %s %s: %v", selectorType, selectorDisplay, err)
+			}
+
+			// Fallback to direct connection
+			logger.Warn("ProxyDialer: Falling back to direct connection for %s", address)
+			dialer := &net.Dialer{Timeout: d.timeout}
+			return dialer.DialContext(ctx, network, address)
+		}
+
+		nodeName := selectedOutbound.Name
+		logger.Debug("ProxyDialer: Selected node '%s' from %s %s", nodeName, selectorType, selectorDisplay)
+
+		// Try to connect through the selected node
+		packetConn, err := d.outboundMgr.DialPacketConn(ctx, nodeName, address)
+		if err != nil {
+			// Connection failed - add to excluded list and try next node
+			// Requirements: 3.1, 3.2 - Automatic failover and logging
+			excludedNodes = append(excludedNodes, nodeName)
+
+			d.mu.Lock()
+			d.excludedNodes = excludedNodes
+			d.mu.Unlock()
+
+			logger.Warn("ProxyDialer: Failover - node '%s' failed: %v, trying next node", nodeName, err)
+
+			// Check context cancellation before retrying
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+				continue // Try next node
+			}
+		}
+
+		// Connection successful
+		d.mu.Lock()
+		previousNode := d.selectedNode
+		d.selectedNode = nodeName
+		d.mu.Unlock()
+
+		// Log failover success if we had to try multiple nodes
+		// Requirements: 3.2 - Log failover event with original and new node names
+		if len(excludedNodes) > 0 {
+			logger.Info("ProxyDialer: Failover successful - connected via '%s' after %d failed attempts (failed: %v)",
+				nodeName, len(excludedNodes), excludedNodes)
+		} else if previousNode != "" && previousNode != nodeName {
+			logger.Debug("ProxyDialer: Node selection changed from '%s' to '%s'", previousNode, nodeName)
+		}
+
+		logger.Debug("ProxyDialer: PacketConn created for %s via '%s'", address, nodeName)
+
+		// Wrap PacketConn as a Conn for go-raknet compatibility
+		remoteAddr := parseUDPAddr(address)
+		return &packetConnWrapper{
+			PacketConn: packetConn,
+			remoteAddr: remoteAddr,
+		}, nil
+	}
 }
 
 // shouldUseDirect returns true if direct connection should be used.

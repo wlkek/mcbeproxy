@@ -553,14 +553,27 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 		dialer := raknet.Dialer{
 			UpstreamDialer: proxyDialer,
 		}
-		proxyName := serverCfg.GetProxyOutbound()
-		logger.Info("Connecting to remote %s via proxy outbound %s", targetAddr, proxyName)
+		proxyConfig := serverCfg.GetProxyOutbound()
+		// Log proxy config type
+		if strings.Contains(proxyConfig, ",") {
+			nodeCount := len(strings.Split(proxyConfig, ","))
+			logger.Info("Connecting to remote %s via node-list (%d nodes)", targetAddr, nodeCount)
+		} else if strings.HasPrefix(proxyConfig, "@") {
+			logger.Info("Connecting to remote %s via group %s", targetAddr, proxyConfig)
+		} else {
+			logger.Info("Connecting to remote %s via node '%s'", targetAddr, proxyConfig)
+		}
 		logger.Debug("ProxyDialer created, attempting RakNet dial to %s", targetAddr)
 		remoteConn, err = dialer.Dial(targetAddr)
 		if err != nil {
 			logger.Error("RakNet dial via proxy failed: %v", err)
 		} else {
-			logger.Info("RakNet connection established via proxy to %s", targetAddr)
+			selectedNode := proxyDialer.GetSelectedNode()
+			if selectedNode != "" {
+				logger.Info("RakNet connection established via proxy '%s' to %s", selectedNode, targetAddr)
+			} else {
+				logger.Info("RakNet connection established via proxy to %s", targetAddr)
+			}
 		}
 	} else {
 		// Use direct connection

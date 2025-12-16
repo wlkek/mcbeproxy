@@ -340,3 +340,264 @@ func TestProperty4_ConfigurationFieldParsing(t *testing.T) {
 
 	properties.TestingRun(t)
 }
+
+// **Feature: proxy-load-balancing, Property 1: Proxy Outbound Parsing**
+// **Validates: Requirements 1.1, 1.2**
+//
+// *For any* proxy_outbound string, if it starts with "@" then IsGroupSelection() returns true
+// and GetGroupName() returns the string without the "@" prefix; otherwise IsGroupSelection()
+// returns false and the string is used as a direct node name.
+func TestProperty1_ProxyOutboundParsing(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+	properties := gopter.NewProperties(parameters)
+
+	// Generator for non-empty strings (group names without @)
+	nonEmptyString := gen.AnyString().SuchThat(func(s string) bool {
+		return len(s) > 0
+	})
+
+	// Generator for strings that don't start with @
+	nonGroupString := gen.AnyString().SuchThat(func(s string) bool {
+		return len(s) == 0 || s[0] != '@'
+	})
+
+	// Property: proxy_outbound starting with "@" is recognized as group selection
+	properties.Property("@ prefix indicates group selection", prop.ForAll(
+		func(groupName string) bool {
+			config := &ServerConfig{
+				ProxyOutbound: "@" + groupName,
+			}
+			return config.IsGroupSelection() == true
+		},
+		nonEmptyString,
+	))
+
+	// Property: GetGroupName returns the group name without "@" prefix
+	properties.Property("GetGroupName returns name without @ prefix", prop.ForAll(
+		func(groupName string) bool {
+			config := &ServerConfig{
+				ProxyOutbound: "@" + groupName,
+			}
+			return config.GetGroupName() == groupName
+		},
+		nonEmptyString,
+	))
+
+	// Property: proxy_outbound without "@" prefix is not group selection
+	properties.Property("no @ prefix means not group selection", prop.ForAll(
+		func(nodeName string) bool {
+			config := &ServerConfig{
+				ProxyOutbound: nodeName,
+			}
+			return config.IsGroupSelection() == false
+		},
+		nonGroupString,
+	))
+
+	// Property: GetGroupName returns empty string for non-group selection
+	properties.Property("GetGroupName returns empty for non-group", prop.ForAll(
+		func(nodeName string) bool {
+			config := &ServerConfig{
+				ProxyOutbound: nodeName,
+			}
+			return config.GetGroupName() == ""
+		},
+		nonGroupString,
+	))
+
+	// Property: JSON round-trip preserves proxy_outbound with @ prefix
+	properties.Property("JSON round-trip preserves group selection", prop.ForAll(
+		func(groupName string) bool {
+			original := &ServerConfig{
+				ID:            "test",
+				Name:          "test",
+				Target:        "localhost",
+				Port:          19132,
+				ListenAddr:    "0.0.0.0:19132",
+				Protocol:      "raknet",
+				ProxyOutbound: "@" + groupName,
+			}
+
+			data, err := json.Marshal(original)
+			if err != nil {
+				return false
+			}
+
+			var parsed ServerConfig
+			if err := json.Unmarshal(data, &parsed); err != nil {
+				return false
+			}
+
+			return parsed.IsGroupSelection() == true && parsed.GetGroupName() == groupName
+		},
+		nonEmptyString,
+	))
+
+	properties.TestingRun(t)
+}
+
+// **Feature: proxy-load-balancing, Property 2: Load Balance Default Strategy**
+// **Validates: Requirements 1.4**
+//
+// *For any* ServerConfig with empty or missing load_balance field,
+// GetLoadBalance() shall return "least-latency".
+func TestProperty2_LoadBalanceDefaultStrategy(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+	properties := gopter.NewProperties(parameters)
+
+	// Generator for non-empty strings
+	nonEmptyString := gen.AnyString().SuchThat(func(s string) bool {
+		return len(s) > 0
+	})
+
+	// Generator for valid load balance strategies
+	validStrategy := gen.OneConstOf(
+		LoadBalanceLeastLatency,
+		LoadBalanceRoundRobin,
+		LoadBalanceRandom,
+		LoadBalanceLeastConnections,
+	)
+
+	// Property: Empty load_balance defaults to "least-latency"
+	properties.Property("empty load_balance defaults to least-latency", prop.ForAll(
+		func(id, name string) bool {
+			config := &ServerConfig{
+				ID:          id,
+				Name:        name,
+				LoadBalance: "", // Empty
+			}
+			return config.GetLoadBalance() == LoadBalanceLeastLatency
+		},
+		nonEmptyString,
+		nonEmptyString,
+	))
+
+	// Property: Explicit load_balance value is preserved
+	properties.Property("explicit load_balance is preserved", prop.ForAll(
+		func(id, name, strategy string) bool {
+			config := &ServerConfig{
+				ID:          id,
+				Name:        name,
+				LoadBalance: strategy,
+			}
+			return config.GetLoadBalance() == strategy
+		},
+		nonEmptyString,
+		nonEmptyString,
+		validStrategy,
+	))
+
+	// Property: JSON round-trip preserves load_balance
+	properties.Property("JSON round-trip preserves load_balance", prop.ForAll(
+		func(strategy string) bool {
+			original := &ServerConfig{
+				ID:          "test",
+				Name:        "test",
+				Target:      "localhost",
+				Port:        19132,
+				ListenAddr:  "0.0.0.0:19132",
+				Protocol:    "raknet",
+				LoadBalance: strategy,
+			}
+
+			data, err := json.Marshal(original)
+			if err != nil {
+				return false
+			}
+
+			var parsed ServerConfig
+			if err := json.Unmarshal(data, &parsed); err != nil {
+				return false
+			}
+
+			return parsed.LoadBalance == strategy
+		},
+		validStrategy,
+	))
+
+	properties.TestingRun(t)
+}
+
+// **Feature: proxy-load-balancing, Property 3: Load Balance Sort Default**
+// **Validates: Requirements 2.8**
+//
+// *For any* ServerConfig with empty or missing load_balance_sort field,
+// GetLoadBalanceSort() shall return "udp".
+func TestProperty3_LoadBalanceSortDefault(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+	properties := gopter.NewProperties(parameters)
+
+	// Generator for non-empty strings
+	nonEmptyString := gen.AnyString().SuchThat(func(s string) bool {
+		return len(s) > 0
+	})
+
+	// Generator for valid load balance sort types
+	validSortType := gen.OneConstOf(
+		LoadBalanceSortUDP,
+		LoadBalanceSortTCP,
+		LoadBalanceSortHTTP,
+	)
+
+	// Property: Empty load_balance_sort defaults to "udp"
+	properties.Property("empty load_balance_sort defaults to udp", prop.ForAll(
+		func(id, name string) bool {
+			config := &ServerConfig{
+				ID:              id,
+				Name:            name,
+				LoadBalanceSort: "", // Empty
+			}
+			return config.GetLoadBalanceSort() == LoadBalanceSortUDP
+		},
+		nonEmptyString,
+		nonEmptyString,
+	))
+
+	// Property: Explicit load_balance_sort value is preserved
+	properties.Property("explicit load_balance_sort is preserved", prop.ForAll(
+		func(id, name, sortType string) bool {
+			config := &ServerConfig{
+				ID:              id,
+				Name:            name,
+				LoadBalanceSort: sortType,
+			}
+			return config.GetLoadBalanceSort() == sortType
+		},
+		nonEmptyString,
+		nonEmptyString,
+		validSortType,
+	))
+
+	// Property: JSON round-trip preserves load_balance_sort
+	properties.Property("JSON round-trip preserves load_balance_sort", prop.ForAll(
+		func(sortType string) bool {
+			original := &ServerConfig{
+				ID:              "test",
+				Name:            "test",
+				Target:          "localhost",
+				Port:            19132,
+				ListenAddr:      "0.0.0.0:19132",
+				Protocol:        "raknet",
+				LoadBalanceSort: sortType,
+			}
+
+			data, err := json.Marshal(original)
+			if err != nil {
+				return false
+			}
+
+			var parsed ServerConfig
+			if err := json.Unmarshal(data, &parsed); err != nil {
+				return false
+			}
+
+			return parsed.LoadBalanceSort == sortType
+		},
+		validSortType,
+	))
+
+	properties.TestingRun(t)
+}

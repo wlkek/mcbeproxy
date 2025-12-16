@@ -378,17 +378,27 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 	// Requirements: 2.1, 2.2, 2.3, 2.4
 	useProxy := p.outboundMgr != nil && !serverCfg.IsDirectConnection()
 
+	var lastProxyDialer *ProxyDialer
 	for i := 0; i < 3; i++ {
 		logger.Debug("Attempting RakNet connection to %s (attempt %d/3)", targetAddr, i+1)
 
 		if useProxy {
 			// Use proxy dialer for outbound connection
 			proxyDialer := NewProxyDialer(p.outboundMgr, serverCfg, 15*time.Second)
+			lastProxyDialer = proxyDialer
 			dialer := raknet.Dialer{
 				UpstreamDialer: proxyDialer,
 			}
 			if i == 0 {
-				logger.Info("Connecting to remote %s via proxy outbound %s", targetAddr, serverCfg.GetProxyOutbound())
+				proxyConfig := serverCfg.GetProxyOutbound()
+				if strings.Contains(proxyConfig, ",") {
+					nodeCount := len(strings.Split(proxyConfig, ","))
+					logger.Info("Connecting to remote %s via node-list (%d nodes)", targetAddr, nodeCount)
+				} else if strings.HasPrefix(proxyConfig, "@") {
+					logger.Info("Connecting to remote %s via group %s", targetAddr, proxyConfig)
+				} else {
+					logger.Info("Connecting to remote %s via node '%s'", targetAddr, proxyConfig)
+				}
 			}
 			remoteConn, err = dialer.DialTimeout(targetAddr, 15*time.Second)
 		} else {
@@ -407,7 +417,12 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 	if err != nil {
 		// Requirements: 2.4 - Log warning for proxy failures
 		if useProxy {
-			logger.Warn("Failed to connect to remote %s via proxy %s after 3 attempts: %v", targetAddr, serverCfg.GetProxyOutbound(), err)
+			proxyConfig := serverCfg.GetProxyOutbound()
+			if strings.Contains(proxyConfig, ",") {
+				logger.Warn("Failed to connect to remote %s via node-list after 3 attempts: %v", targetAddr, err)
+			} else {
+				logger.Warn("Failed to connect to remote %s via proxy '%s' after 3 attempts: %v", targetAddr, proxyConfig, err)
+			}
 		} else {
 			logger.Error("Failed to connect to remote %s after 3 attempts: %v", targetAddr, err)
 		}
@@ -415,7 +430,17 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 	}
 	defer remoteConn.Close()
 
-	logger.Info("Connected to remote: %s -> %s", clientAddr, targetAddr)
+	// Log the actual selected node for proxy connections
+	if useProxy && lastProxyDialer != nil {
+		selectedNode := lastProxyDialer.GetSelectedNode()
+		if selectedNode != "" {
+			logger.Info("Connected to remote %s via proxy '%s'", targetAddr, selectedNode)
+		} else {
+			logger.Info("Connected to remote: %s -> %s", clientAddr, targetAddr)
+		}
+	} else {
+		logger.Info("Connected to remote: %s -> %s", clientAddr, targetAddr)
+	}
 
 	// Create context for this connection
 	connCtx, cancel := context.WithCancel(ctx)

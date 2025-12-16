@@ -1333,3 +1333,53 @@ func buildRakNetPing() []byte {
 
 	return packet
 }
+
+// ListGroupsResponse represents the response for listing all groups.
+type ListGroupsResponse struct {
+	Success bool                `json:"success"`
+	Data    []*proxy.GroupStats `json:"data"`
+}
+
+// GetGroupResponse represents the response for getting a single group.
+type GetGroupResponse struct {
+	Success bool              `json:"success"`
+	Data    *proxy.GroupStats `json:"data"`
+}
+
+// ListGroups returns statistics for all proxy outbound groups.
+// GET /api/proxy-outbounds/groups
+// Requirements: 8.1, 8.4
+func (h *ProxyOutboundHandler) ListGroups(c *gin.Context) {
+	if h.outboundMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Outbound manager not initialized", "")
+		return
+	}
+
+	groups := h.outboundMgr.ListGroups()
+	if groups == nil {
+		groups = []*proxy.GroupStats{}
+	}
+
+	respondSuccess(c, groups)
+}
+
+// GetGroup returns statistics for a specific proxy outbound group.
+// GET /api/proxy-outbounds/groups/:name
+// Requirements: 8.2, 8.3
+func (h *ProxyOutboundHandler) GetGroup(c *gin.Context) {
+	if h.outboundMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Outbound manager not initialized", "")
+		return
+	}
+
+	groupName := c.Param("name")
+
+	// Get group statistics
+	stats := h.outboundMgr.GetGroupStats(groupName)
+	if stats == nil {
+		respondError(c, http.StatusNotFound, "Group not found", fmt.Sprintf("No group found with name '%s'", groupName))
+		return
+	}
+
+	respondSuccess(c, stats)
+}

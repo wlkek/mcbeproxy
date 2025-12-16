@@ -30,6 +30,7 @@ func (m *mockProxyController) GetServerStatus(serverID string) string          {
 func (m *mockProxyController) GetActiveSessionsForServer(serverID string) int  { return 0 }
 func (m *mockProxyController) GetAllServerStatuses() []config.ServerConfigDTO  { return nil }
 func (m *mockProxyController) KickPlayer(playerName string, reason string) int { return 0 }
+func (m *mockProxyController) GetServerLatency(serverID string) (int64, bool)  { return 0, false }
 
 // setupTestAPI creates a test API server with a temporary database.
 func setupTestAPI(t *testing.T) (*APIServer, *db.Database, func()) {

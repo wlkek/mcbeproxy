@@ -216,6 +216,10 @@ func (a *APIServer) setupRoutes() {
 				proxyOutboundGroup.POST("/get", a.proxyOutboundHandler.GetProxyOutboundByBody)
 				proxyOutboundGroup.POST("/update", a.proxyOutboundHandler.UpdateProxyOutboundByBody)
 				proxyOutboundGroup.POST("/delete", a.proxyOutboundHandler.DeleteProxyOutboundByBody)
+				// Group statistics endpoints (must be before /:name to avoid conflicts)
+				// Requirements: 8.1, 8.2, 8.3, 8.4
+				proxyOutboundGroup.GET("/groups", a.proxyOutboundHandler.ListGroups)
+				proxyOutboundGroup.GET("/groups/:name", a.proxyOutboundHandler.GetGroup)
 				// Legacy endpoints with name in URL (kept for compatibility)
 				proxyOutboundGroup.GET("/:name", a.proxyOutboundHandler.GetProxyOutbound)
 				proxyOutboundGroup.PUT("/:name", a.proxyOutboundHandler.UpdateProxyOutbound)

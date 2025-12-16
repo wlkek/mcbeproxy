@@ -580,12 +580,14 @@ func (p *ProxyServer) reloadProxyOutbounds() error {
 	}
 
 	// Remove outbounds that no longer exist in config
+	var deletedCount, addedCount, updatedCount int
 	for name := range currentMap {
 		if _, exists := configMap[name]; !exists {
 			if err := p.outboundMgr.DeleteOutbound(name); err != nil {
 				logger.Error("Failed to delete outbound %s: %v", name, err)
 			} else {
-				logger.Info("Deleted proxy outbound: %s", name)
+				logger.Debug("Deleted proxy outbound: %s", name)
+				deletedCount++
 			}
 		}
 	}
@@ -597,26 +599,34 @@ func (p *ProxyServer) reloadProxyOutbounds() error {
 			if err := p.outboundMgr.AddOutbound(cfg); err != nil {
 				logger.Error("Failed to add outbound %s: %v", name, err)
 			} else {
-				logger.Info("Added proxy outbound: %s", name)
+				logger.Debug("Added proxy outbound: %s", name)
+				addedCount++
 			}
 		} else {
-			// Update existing outbound
+			// Update existing outbound (only updates runtime state like latency)
 			if err := p.outboundMgr.UpdateOutbound(name, cfg); err != nil {
 				logger.Error("Failed to update outbound %s: %v", name, err)
 			} else {
-				logger.Info("Updated proxy outbound: %s", name)
+				updatedCount++
 			}
 		}
 	}
 
-	// Reload sing-box outbounds
-	// Requirements: 8.2
-	if err := p.outboundMgr.Reload(); err != nil {
-		logger.Error("Failed to reload outbound manager: %v", err)
-		return err
+	// Log summary of changes only if there are actual additions or deletions
+	if addedCount > 0 || deletedCount > 0 {
+		logger.Info("Proxy outbounds changed: %d added, %d deleted", addedCount, deletedCount)
 	}
 
-	logger.Info("Proxy outbounds reloaded, %d outbounds configured", len(configOutbounds))
+	// Reload sing-box outbounds only if there are changes
+	// Requirements: 8.2
+	if addedCount > 0 || deletedCount > 0 {
+		if err := p.outboundMgr.Reload(); err != nil {
+			logger.Error("Failed to reload outbound manager: %v", err)
+			return err
+		}
+		logger.Info("Proxy outbounds reloaded, %d outbounds configured", len(configOutbounds))
+	}
+
 	return nil
 }
 

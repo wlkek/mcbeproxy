@@ -42,7 +42,7 @@
             <n-layout-content :style="{ padding: isMobile ? '12px' : '16px', overflowX: 'auto' }">
               <Dashboard v-if="currentPage === 'dashboard'" />
               <Servers v-else-if="currentPage === 'servers'" />
-              <ProxyOutbounds v-else-if="currentPage === 'proxy-outbounds'" :initial-search="searchParam" :key="'proxy-outbounds-' + searchKey" />
+              <ProxyOutbounds v-else-if="currentPage === 'proxy-outbounds'" :initial-search="searchParam" :initial-highlight="highlightParam" :key="'proxy-outbounds-' + searchKey" />
               <Players v-else-if="currentPage === 'players'" :initial-search="searchParam" :key="'players-' + searchKey" />
               <Blacklist v-else-if="currentPage === 'blacklist'" />
               <Whitelist v-else-if="currentPage === 'whitelist'" />
@@ -98,8 +98,11 @@ const menuOptions = [
   { label: '设置', key: 'settings', icon: renderIcon(SettingsOutline) }
 ]
 
-const navigateTo = (page, search) => {
+const highlightParam = ref('')
+
+const navigateTo = (page, search, highlight) => {
   searchParam.value = typeof search === 'string' ? search : ''
+  highlightParam.value = typeof highlight === 'string' ? highlight : ''
   searchKey.value++
   currentPage.value = page
 }
@@ -110,8 +113,8 @@ const handleMobileNav = (page) => {
 }
 
 const handleNavigate = (e) => {
-  const { page, search } = e.detail || {}
-  navigateTo(page, search || '')
+  const { page, search, highlight } = e.detail || {}
+  navigateTo(page, search || '', highlight || '')
 }
 
 const handleResize = () => {
