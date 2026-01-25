@@ -16,6 +16,9 @@ type SessionManager struct {
 	sessions    map[string]*Session // clientAddr -> session
 	mu          sync.RWMutex
 	idleTimeout time.Duration
+	// idleTimeoutFunc allows per-session idle timeout overrides (e.g., per server config).
+	// Return <=0 to fall back to the default idleTimeout.
+	idleTimeoutFunc func(session *Session) time.Duration
 	// Callbacks for persistence (set by proxy server)
 	OnSessionEnd func(session *Session)
 }
@@ -26,6 +29,23 @@ func NewSessionManager(idleTimeout time.Duration) *SessionManager {
 		sessions:    make(map[string]*Session),
 		idleTimeout: idleTimeout,
 	}
+}
+
+// SetIdleTimeoutFunc sets a per-session idle timeout override function.
+// This is optional; if not set or returns <=0, the default idleTimeout is used.
+func (sm *SessionManager) SetIdleTimeoutFunc(fn func(session *Session) time.Duration) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.idleTimeoutFunc = fn
+}
+
+func (sm *SessionManager) getIdleTimeout(session *Session) time.Duration {
+	if sm.idleTimeoutFunc != nil {
+		if v := sm.idleTimeoutFunc(session); v > 0 {
+			return v
+		}
+	}
+	return sm.idleTimeout
 }
 
 // GetOrCreate retrieves an existing session or creates a new one for the client address.
@@ -293,7 +313,8 @@ func (sm *SessionManager) cleanupIdleSessions() {
 		lastSeen := session.LastSeen
 		session.mu.Unlock()
 
-		if now.Sub(lastSeen) > sm.idleTimeout {
+		idleTimeout := sm.getIdleTimeout(session)
+		if idleTimeout > 0 && now.Sub(lastSeen) > idleTimeout {
 			toRemove = append(toRemove, clientAddr)
 		}
 	}
@@ -318,7 +339,7 @@ func (sm *SessionManager) GetIdleSessions(idleThreshold time.Duration) []*Sessio
 		lastSeen := session.LastSeen
 		session.mu.Unlock()
 
-		if now.Sub(lastSeen) > idleThreshold {
+		if idleThreshold > 0 && now.Sub(lastSeen) > idleThreshold {
 			idleSessions = append(idleSessions, session)
 		}
 	}
@@ -338,7 +359,8 @@ func (sm *SessionManager) CleanupNow() int {
 		lastSeen := session.LastSeen
 		session.mu.Unlock()
 
-		if now.Sub(lastSeen) > sm.idleTimeout {
+		idleTimeout := sm.getIdleTimeout(session)
+		if idleTimeout > 0 && now.Sub(lastSeen) > idleTimeout {
 			toRemove = append(toRemove, clientAddr)
 		}
 	}

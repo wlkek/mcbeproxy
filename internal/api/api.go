@@ -928,6 +928,7 @@ func (a *APIServer) getConfig(c *gin.Context) {
 		"auth_verify_enabled":    a.globalConfig.AuthVerifyEnabled,
 		"auth_verify_url":        a.globalConfig.AuthVerifyURL,
 		"auth_cache_minutes":     a.globalConfig.AuthCacheMinutes,
+		"passthrough_idle_timeout": a.globalConfig.PassthroughIdleTimeout,
 	}
 	respondSuccess(c, configDTO)
 }
@@ -952,6 +953,7 @@ func (a *APIServer) updateConfig(c *gin.Context) {
 		AuthVerifyEnabled   bool   `json:"auth_verify_enabled"`
 		AuthVerifyURL       string `json:"auth_verify_url"`
 		AuthCacheMinutes    int    `json:"auth_cache_minutes"`
+		PassthroughIdleTimeout *int `json:"passthrough_idle_timeout"`
 		Restart             bool   `json:"restart"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -988,6 +990,13 @@ func (a *APIServer) updateConfig(c *gin.Context) {
 	}
 	if req.AuthCacheMinutes > 0 {
 		a.globalConfig.AuthCacheMinutes = req.AuthCacheMinutes
+	}
+	if req.PassthroughIdleTimeout != nil {
+		if *req.PassthroughIdleTimeout < 0 {
+			respondError(c, http.StatusBadRequest, "Invalid passthrough_idle_timeout", "passthrough_idle_timeout cannot be negative")
+			return
+		}
+		a.globalConfig.PassthroughIdleTimeout = *req.PassthroughIdleTimeout
 	}
 
 	// Note: Actual restart would require additional implementation

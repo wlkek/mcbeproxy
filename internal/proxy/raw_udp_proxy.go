@@ -36,6 +36,9 @@ const (
 	UDPWriteTimeout = 5 * time.Second
 	// DefaultClientInactiveTimeout is used when config idle_timeout is not set.
 	DefaultClientInactiveTimeout = 5 * time.Minute
+	// PassthroughClientInactiveTimeout is the default for passthrough raw-compat mode.
+	// Shorter timeout helps remove offline players promptly without relying on RakNet close.
+	PassthroughClientInactiveTimeout = 30 * time.Second
 	// RawUDPPingRefreshInterval throttles expensive proxy pings (QUIC handshakes).
 	RawUDPPingRefreshInterval = 60 * time.Second
 	// RawUDPUnconnectedPingMinIntervalPerIP rate-limits server-list pings to reduce CPU under scanning.
@@ -193,6 +196,7 @@ type RawUDPProxy struct {
 	pingInFlight  atomic.Bool
 
 	clientInactiveTimeout time.Duration
+	passthroughIdleTimeoutOverride time.Duration
 
 	// Basic unconnected ping rate limiting (per source IP, port-less).
 	lastUnconnectedPing sync.Map // map[string]int64 unixnano
@@ -231,6 +235,13 @@ func (p *RawUDPProxy) SetExternalVerifier(verifier ExternalVerifier) {
 // SetOutboundManager sets the outbound manager for proxy routing.
 func (p *RawUDPProxy) SetOutboundManager(outboundMgr OutboundManager) {
 	p.outboundMgr = outboundMgr
+}
+
+// SetPassthroughIdleTimeoutOverride sets a global override for passthrough idle timeout.
+// Use 0 to disable override and fall back to per-server idle_timeout.
+func (p *RawUDPProxy) SetPassthroughIdleTimeoutOverride(timeout time.Duration) {
+	p.passthroughIdleTimeoutOverride = timeout
+	p.updateTimeouts()
 }
 
 // GetOutboundManager returns the outbound manager.
@@ -925,8 +936,14 @@ func (p *RawUDPProxy) cleanupUnconnectedPingLimiter() {
 
 func (p *RawUDPProxy) updateTimeouts() {
 	timeout := DefaultClientInactiveTimeout
-	if p.config != nil && p.config.IdleTimeout > 0 {
+	if p.config != nil && strings.EqualFold(p.config.GetProxyMode(), "passthrough") && p.passthroughIdleTimeoutOverride > 0 {
+		// passthrough 全局覆盖优先
+		timeout = p.passthroughIdleTimeoutOverride
+	} else if p.config != nil && p.config.IdleTimeout > 0 {
 		timeout = time.Duration(p.config.IdleTimeout) * time.Second
+	} else if p.config != nil && strings.EqualFold(p.config.GetProxyMode(), "passthrough") {
+		// passthrough + raw compat: 默认用更短的空闲超时，避免玩家退出后长时间仍显示在线
+		timeout = PassthroughClientInactiveTimeout
 	}
 	if timeout < 30*time.Second {
 		timeout = 30 * time.Second

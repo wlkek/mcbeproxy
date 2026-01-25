@@ -588,6 +588,9 @@ type GlobalConfig struct {
 	AuthVerifyEnabled   bool   `json:"auth_verify_enabled"` // Enable external auth verification
 	AuthVerifyURL       string `json:"auth_verify_url"`     // External auth verification URL
 	AuthCacheMinutes    int    `json:"auth_cache_minutes"`  // Cache duration for auth results
+	// PassthroughIdleTimeout is the global idle timeout (seconds) for passthrough online sessions.
+	// 0 disables the override and falls back to per-server idle_timeout.
+	PassthroughIdleTimeout int `json:"passthrough_idle_timeout"`
 }
 
 // DefaultGlobalConfig returns a GlobalConfig with default values.
@@ -605,6 +608,7 @@ func DefaultGlobalConfig() *GlobalConfig {
 		AuthVerifyEnabled:   false,
 		AuthVerifyURL:       "",
 		AuthCacheMinutes:    15,
+		PassthroughIdleTimeout: 30,
 	}
 }
 
@@ -672,6 +676,9 @@ func (gc *GlobalConfig) Validate() error {
 	}
 	if gc.APIPort < 0 || gc.APIPort > 65535 {
 		return fmt.Errorf("api_port must be between 0 and 65535, got %d", gc.APIPort)
+	}
+	if gc.PassthroughIdleTimeout < 0 {
+		return errors.New("passthrough_idle_timeout cannot be negative")
 	}
 	return nil
 }

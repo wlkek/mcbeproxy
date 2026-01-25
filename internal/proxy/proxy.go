@@ -70,6 +70,22 @@ func NewProxyServer(
 
 	// Create session manager with default idle timeout (5 minutes)
 	sessionMgr := session.NewSessionManager(5 * time.Minute)
+	// 使用服务器配置的 idle_timeout 覆盖会话空闲超时（可被全局 passthrough 覆盖）
+	sessionMgr.SetIdleTimeoutFunc(func(sess *session.Session) time.Duration {
+		if sess == nil || configMgr == nil {
+			return 0
+		}
+		serverCfg, ok := configMgr.GetServer(sess.ServerID)
+		if ok && strings.EqualFold(serverCfg.GetProxyMode(), "passthrough") {
+			if globalConfig != nil && globalConfig.PassthroughIdleTimeout > 0 {
+				return time.Duration(globalConfig.PassthroughIdleTimeout) * time.Second
+			}
+		}
+		if !ok || serverCfg.IdleTimeout <= 0 {
+			return 0
+		}
+		return time.Duration(serverCfg.IdleTimeout) * time.Second
+	})
 
 	// Create repositories
 	sessionRepo := db.NewSessionRepository(database, globalConfig.MaxSessionRecords)
@@ -369,6 +385,10 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 			p.configMgr,
 			p.sessionMgr,
 		)
+		// Global override for passthrough idle timeout
+		if p.config != nil && p.config.PassthroughIdleTimeout > 0 {
+			passthroughProxy.SetPassthroughIdleTimeoutOverride(time.Duration(p.config.PassthroughIdleTimeout) * time.Second)
+		}
 		// Inject ACL manager for access control (Requirement 5.1)
 		if p.aclManager != nil {
 			passthroughProxy.SetACLManager(p.aclManager)

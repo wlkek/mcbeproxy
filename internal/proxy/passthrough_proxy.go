@@ -75,6 +75,7 @@ type PassthroughProxy struct {
 	outboundMgr      OutboundManager  // Outbound manager for proxy routing
 	rawCompat        *RawUDPProxy
 	useRawCompat     bool
+	passthroughIdleTimeoutOverride time.Duration
 	closed           atomic.Bool
 	wg               sync.WaitGroup
 	activeConns      map[*raknet.Conn]*connInfo // Track active connections with player info
@@ -140,6 +141,14 @@ func (p *PassthroughProxy) SetOutboundManager(outboundMgr OutboundManager) {
 	}
 }
 
+// SetPassthroughIdleTimeoutOverride sets a global override for passthrough idle timeout.
+func (p *PassthroughProxy) SetPassthroughIdleTimeoutOverride(timeout time.Duration) {
+	p.passthroughIdleTimeoutOverride = timeout
+	if p.rawCompat != nil {
+		p.rawCompat.SetPassthroughIdleTimeoutOverride(timeout)
+	}
+}
+
 // GetOutboundManager returns the outbound manager (may be nil if not set).
 func (p *PassthroughProxy) GetOutboundManager() OutboundManager {
 	return p.outboundMgr
@@ -169,6 +178,9 @@ func (p *PassthroughProxy) Start() error {
 				p.rawCompat.SetExternalVerifier(p.externalVerifier)
 			}
 			p.rawCompat.SetOutboundManager(p.outboundMgr)
+			if p.passthroughIdleTimeoutOverride > 0 {
+				p.rawCompat.SetPassthroughIdleTimeoutOverride(p.passthroughIdleTimeoutOverride)
+			}
 		} else {
 			p.rawCompat.UpdateConfig(p.config)
 			if p.aclManager != nil {
@@ -178,6 +190,9 @@ func (p *PassthroughProxy) Start() error {
 				p.rawCompat.SetExternalVerifier(p.externalVerifier)
 			}
 			p.rawCompat.SetOutboundManager(p.outboundMgr)
+			if p.passthroughIdleTimeoutOverride > 0 {
+				p.rawCompat.SetPassthroughIdleTimeoutOverride(p.passthroughIdleTimeoutOverride)
+			}
 		}
 		logger.Info("Passthrough proxy using raw UDP compatible forwarding for server %s", p.serverID)
 		return p.rawCompat.Start()
@@ -779,7 +794,7 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 		var lastParseableRemotePacket []byte
 		// Use longer timeout to reduce CPU usage from frequent deadline checks
 		const readTimeout = 2 * time.Second
-		const maxConsecutiveTimeouts = 15 // 30 seconds of no data (500ms * 60)
+		const maxConsecutiveTimeouts = 15 // 30 seconds of no data (2s * 15)
 		activityUpdateCounter := 0
 
 		for {
@@ -870,7 +885,7 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 		consecutiveTimeouts := 0
 		// Use longer timeout to reduce CPU usage from frequent deadline checks
 		const readTimeout = 2 * time.Second
-		const maxConsecutiveTimeouts = 15 // 30 seconds of no data (500ms * 60)
+		const maxConsecutiveTimeouts = 15 // 30 seconds of no data (2s * 15)
 		activityUpdateCounter := 0
 
 		for {
@@ -922,6 +937,25 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 			}
 		}
 	}()
+
+	// 在线状态保活：每 10 秒检查一次连接是否仍然存活，存活则刷新 LastSeen。
+	// 这样即使玩家空闲不发“游戏包”，在线列表也不会在 5 分钟后被 GC 清理。
+	if sess != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-connCtx.Done():
+					return
+				case <-ticker.C:
+					sess.UpdateLastSeen()
+				}
+			}
+		}()
+	}
 
 	wg.Wait()
 
