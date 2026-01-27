@@ -222,6 +222,7 @@
             :max-height="350"
             :scroll-x="1100"
             :row-key="r => r.name"
+            :row-props="formSelectRowProps"
             v-model:checked-row-keys="formSelectedNodes"
             :pagination="formProxySelectorPagination"
             @update:page="p => formProxySelectorPagination.page = p"
@@ -259,6 +260,7 @@
 import { ref, reactive, computed, onMounted, nextTick, h } from 'vue'
 import { useMessage, NTag, NButton, NSpace } from 'naive-ui'
 import { api } from '../api'
+import { useDragSelect } from '../composables/useDragSelect'
 
 const message = useMessage()
 const loading = ref(false)
@@ -277,6 +279,9 @@ const formSelectedNodes = ref([])
 const formLoadBalance = ref('least-latency')
 const formLoadBalanceSort = ref('tcp')
 const formProxyFilter = ref({ group: '', protocol: '', udpOnly: false, search: '' })
+
+// 拖选功能实例（按住勾选列拖动多选）
+const { rowProps: formSelectRowProps } = useDragSelect(formSelectedNodes, 'name')
 const formProxySelectorPagination = ref({
   page: 1,
   pageSize: 100,

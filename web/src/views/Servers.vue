@@ -213,6 +213,7 @@
             :max-height="400"
             :scroll-x="1000"
             :row-key="r => r.name"
+            :row-props="quickSelectRowProps"
             v-model:checked-row-keys="quickCheckedKeys"
             :pagination="proxySelectorPagination"
             @update:page="p => proxySelectorPagination.page = p"
@@ -363,7 +364,7 @@
               </n-dropdown>
             </n-space>
           </n-space>
-          
+
           <n-data-table 
             :columns="formProxyColumnsWithActions" 
             :data="formFilteredProxyOutbounds" 
@@ -372,6 +373,7 @@
             :max-height="350"
             :scroll-x="1100"
             :row-key="r => r.name"
+            :row-props="formSelectRowProps"
             v-model:checked-row-keys="formSelectedNodes"
             :pagination="formProxySelectorPagination"
             @update:page="p => formProxySelectorPagination.page = p"
@@ -531,6 +533,7 @@
           :max-height="350"
           :scroll-x="900"
           :row-key="r => r.name"
+          :row-props="multiDetailRowProps"
           v-model:checked-row-keys="multiDetailCheckedKeys"
           :pagination="multiDetailPagination"
           @update:page="p => multiDetailPagination.page = p"
@@ -686,6 +689,7 @@
 import { ref, computed, onMounted, h, nextTick } from 'vue'
 import { NTag, NButton, NSpace, NPopconfirm, useMessage, NRadioGroup, NRadioButton, NDropdown, NTooltip } from 'naive-ui'
 import { api } from '../api'
+import { useDragSelect } from '../composables/useDragSelect'
 
 const message = useMessage()
 const servers = ref([])
@@ -1002,6 +1006,11 @@ const batchTestOptions = [
 const batchHttpTarget = ref('cloudflare')
 const customHttpUrl = ref('')
 const batchMcbeAddress = ref('mco.cubecraft.net:19132')
+
+// 拖选功能实例
+const { rowProps: quickSelectRowProps } = useDragSelect(quickCheckedKeys, 'name')
+const { rowProps: formSelectRowProps } = useDragSelect(formSelectedNodes, 'name')
+const { rowProps: multiDetailRowProps } = useDragSelect(multiDetailCheckedKeys, 'name')
 
 const buildHttpTestRequest = (name) => {
   if (customHttpUrl.value) {

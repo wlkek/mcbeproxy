@@ -129,6 +129,7 @@
           :bordered="false" 
           :scroll-x="1500"
           :row-key="r => r.name"
+          :row-props="proxyTableRowProps"
           v-model:checked-row-keys="checkedRowKeys"
           :pagination="pagination"
           @update:page="handlePageChange"
@@ -468,6 +469,7 @@
 import { ref, computed, onMounted, h, watch, nextTick } from 'vue'
 import { NTag, NButton, NSpace, NPopconfirm, useMessage } from 'naive-ui'
 import { api } from '../api'
+import { useDragSelect } from '../composables/useDragSelect'
 
 const props = defineProps({
   initialSearch: { type: String, default: '' },
@@ -494,6 +496,9 @@ const pagination = ref({
   showSizePicker: true,
   prefix: ({ itemCount }) => `共 ${itemCount} 条`
 })
+
+// 拖选功能实例
+const { rowProps: proxyTableRowProps } = useDragSelect(checkedRowKeys, 'name')
 
 // 筛选条件
 const selectedGroup = ref(null)
