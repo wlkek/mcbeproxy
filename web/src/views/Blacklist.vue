@@ -3,6 +3,21 @@
     <n-space justify="space-between" align="center" style="margin-bottom: 16px">
       <n-h2 style="margin: 0">黑名单</n-h2>
       <n-space>
+        <n-input
+          v-model:value="search"
+          placeholder="搜索玩家名 / 原因 / 服务器"
+          style="width: 260px"
+          clearable
+          @keyup.enter="load"
+        />
+        <n-button @click="load">搜索</n-button>
+        <n-button @click="clearSearch">清空搜索</n-button>
+        <n-popconfirm v-if="checkedRowKeys.length > 0" @positive-click="batchRemove">
+          <template #trigger>
+            <n-button type="error">批量移除 ({{ checkedRowKeys.length }})</n-button>
+          </template>
+          确定移除选中的 {{ checkedRowKeys.length }} 条黑名单吗？
+        </n-popconfirm>
         <n-button @click="openExportModal">导出</n-button>
         <n-button @click="openImportModal">导入</n-button>
         <n-button type="primary" @click="showAddModal = true">添加</n-button>
@@ -10,17 +25,34 @@
     </n-space>
     <n-card>
       <div class="table-wrapper">
-        <n-data-table :columns="columns" :data="blacklist" :bordered="false" :pagination="pagination" :scroll-x="800" @update:page="p => pagination.page = p" @update:page-size="s => { pagination.pageSize = s; pagination.page = 1 }" />
+        <n-data-table
+          :columns="columns"
+          :data="filteredBlacklist"
+          :bordered="false"
+          :pagination="pagination"
+          :scroll-x="900"
+          :row-key="rowKey"
+          v-model:checked-row-keys="checkedRowKeys"
+          @update:page="p => pagination.page = p"
+          @update:page-size="s => { pagination.pageSize = s; pagination.page = 1 }"
+        />
       </div>
     </n-card>
 
-    <!-- 添加 Modal -->
-    <n-modal v-model:show="showAddModal" preset="card" title="添加黑名单" style="width: 450px">
+    <!-- 添加 / 编辑 Modal -->
+    <n-modal
+      v-model:show="showAddModal"
+      preset="card"
+      :title="editingEntry ? '编辑黑名单' : '添加黑名单'"
+      style="width: 450px"
+    >
       <n-space vertical>
         <n-input v-model:value="form.player_name" placeholder="玩家名" />
         <n-input v-model:value="form.reason" placeholder="原因" />
         <n-input v-model:value="form.server_id" placeholder="服务器ID (可选，留空为全局)" />
-        <n-button type="error" block @click="addToBlacklist">封禁</n-button>
+        <n-button type="error" block @click="submitForm">
+          {{ editingEntry ? '保存修改' : '封禁' }}
+        </n-button>
       </n-space>
     </n-modal>
 
@@ -68,7 +100,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, h } from 'vue'
+import { ref, reactive, computed, onMounted, h } from 'vue'
 import { NButton, NPopconfirm, useMessage } from 'naive-ui'
 import { api, formatTime } from '../api'
 
@@ -83,6 +115,9 @@ const exportTab = ref('json')
 const importJson = ref('')
 const importText = ref('')
 const form = reactive({ player_name: '', reason: '', server_id: '' })
+const editingEntry = ref(null)
+const search = ref('')
+const checkedRowKeys = ref([])
 const pagination = ref({
   page: 1,
   pageSize: 100,
@@ -91,30 +126,135 @@ const pagination = ref({
   prefix: ({ itemCount }) => `共 ${itemCount} 条`
 })
 
+const rowKey = (row) => `${row.player_name}||${row.server_id || ''}`
+
+const filteredBlacklist = computed(() => {
+  const s = (search.value || '').toLowerCase().trim()
+  if (!s) return blacklist.value
+  return blacklist.value.filter((b) => {
+    const name = (b.player_name || '').toLowerCase()
+    const reason = (b.reason || '').toLowerCase()
+    const server = (b.server_id || '').toLowerCase()
+    return name.includes(s) || reason.includes(s) || server.includes(s)
+  })
+})
+
 const columns = [
+  { type: 'selection', width: 40 },
   { title: '玩家名', key: 'player_name' },
   { title: '原因', key: 'reason' },
   { title: '服务器', key: 'server_id', render: r => r.server_id || '全局' },
   { title: '添加时间', key: 'created_at', render: r => formatTime(r.created_at) },
   { title: '过期时间', key: 'expires_at', render: r => r.expires_at ? formatTime(r.expires_at) : '永久' },
-  { title: '操作', key: 'actions', width: 80, render: r => h(NPopconfirm, { onPositiveClick: () => remove(r.player_name, r.server_id) }, {
-    trigger: () => h(NButton, { size: 'tiny', type: 'error' }, () => '移除'),
-    default: () => '确定移除?'
-  })}
+  {
+    title: '操作',
+    key: 'actions',
+    width: 160,
+    render: r => h('div', { style: 'display:flex;gap:4px;' }, [
+      h(
+        NButton,
+        {
+          size: 'tiny',
+          onClick: () => openEdit(r)
+        },
+        () => '编辑'
+      ),
+      h(
+        NPopconfirm,
+        { onPositiveClick: () => remove(r.player_name, r.server_id) },
+        {
+          trigger: () => h(NButton, { size: 'tiny', type: 'error' }, () => '移除'),
+          default: () => '确定移除?'
+        }
+      )
+    ])
+  }
 ]
 
-const load = async () => { const res = await api('/api/acl/blacklist'); if (res.success) blacklist.value = res.data || [] }
+const load = async () => {
+  const res = await api('/api/acl/blacklist')
+  if (res.success) blacklist.value = res.data || []
+}
+
+const clearSearch = () => {
+  search.value = ''
+}
 
 const addToBlacklist = async () => {
   const res = await api('/api/acl/blacklist', 'POST', { ...form, server_id: form.server_id || null })
-  if (res.success) { message.success('已添加'); showAddModal.value = false; form.player_name = ''; form.reason = ''; form.server_id = ''; load() }
-  else message.error(res.error || '失败')
+  return res
+}
+
+const submitForm = async () => {
+  if (!form.player_name) {
+    message.warning('请填写玩家名')
+    return
+  }
+
+  if (editingEntry.value) {
+    const old = editingEntry.value
+    const url =
+      '/api/acl/blacklist/' +
+      encodeURIComponent(old.player_name) +
+      (old.server_id ? '?server_id=' + old.server_id : '')
+    const delRes = await api(url, 'DELETE')
+    if (!delRes.success) {
+      message.error(delRes.error || '修改失败（删除旧记录失败）')
+      return
+    }
+  }
+
+  const res = await addToBlacklist()
+  if (res.success) {
+    message.success(editingEntry.value ? '已保存' : '已添加')
+    showAddModal.value = false
+    editingEntry.value = null
+    form.player_name = ''
+    form.reason = ''
+    form.server_id = ''
+    load()
+  } else {
+    message.error(res.error || '失败')
+  }
+}
+
+const openEdit = (row) => {
+  editingEntry.value = { player_name: row.player_name, server_id: row.server_id || '' }
+  form.player_name = row.player_name
+  form.reason = row.reason || ''
+  form.server_id = row.server_id || ''
+  showAddModal.value = true
 }
 
 const remove = async (name, serverId) => {
   const url = '/api/acl/blacklist/' + encodeURIComponent(name) + (serverId ? '?server_id=' + serverId : '')
   const res = await api(url, 'DELETE')
-  if (res.success) { message.success('已移除'); load() } else message.error(res.error || '失败')
+  if (res.success) {
+    message.success('已移除')
+    load()
+  } else {
+    message.error(res.error || '失败')
+  }
+}
+
+const batchRemove = async () => {
+  if (!checkedRowKeys.value.length) return
+  let success = 0
+  let failed = 0
+  const keySet = new Set(checkedRowKeys.value)
+  const toRemove = blacklist.value.filter(b => keySet.has(rowKey(b)))
+  for (const item of toRemove) {
+    const url =
+      '/api/acl/blacklist/' +
+      encodeURIComponent(item.player_name) +
+      (item.server_id ? '?server_id=' + item.server_id : '')
+    const res = await api(url, 'DELETE')
+    if (res.success) success++
+    else failed++
+  }
+  message.success(`批量移除完成: ${success} 成功, ${failed} 失败`)
+  checkedRowKeys.value = []
+  load()
 }
 
 const openExportModal = () => { 

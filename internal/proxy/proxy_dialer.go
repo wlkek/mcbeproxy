@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -145,8 +144,14 @@ func (d *ProxyDialer) dialWithLoadBalancing(ctx context.Context, network, addres
 		selectorDisplay = fmt.Sprintf("%d nodes", nodeCount)
 	}
 
-	logger.Debug("ProxyDialer: Load balancing for %s via %s %s (strategy=%s, sortBy=%s, excluded=%v)",
-		address, selectorType, selectorDisplay, strategy, sortBy, excludedNodes)
+	// Log: selecting ONE node from the pool
+	if len(excludedNodes) == 0 {
+		logger.Debug("ProxyDialer: Selecting one node from %s %s for %s (strategy=%s, sortBy=%s)",
+			selectorType, selectorDisplay, address, strategy, sortBy)
+	} else {
+		logger.Debug("ProxyDialer: Failover - selecting next node from %s %s for %s (excluded=%v, strategy=%s, sortBy=%s)",
+			selectorType, selectorDisplay, address, excludedNodes, strategy, sortBy)
+	}
 
 	// Try to select and connect to a node, with failover on failure
 	for {
@@ -169,7 +174,7 @@ func (d *ProxyDialer) dialWithLoadBalancing(ctx context.Context, network, addres
 		}
 
 		nodeName := selectedOutbound.Name
-		logger.Debug("ProxyDialer: Selected node '%s' from %s %s", nodeName, selectorType, selectorDisplay)
+		logger.Debug("ProxyDialer: Selected node '%s' (from %s %s) for %s", nodeName, selectorType, selectorDisplay, address)
 
 		// Try to connect through the selected node
 		packetConn, err := d.outboundMgr.DialPacketConn(ctx, nodeName, address)
@@ -343,7 +348,8 @@ func (c *packetConnWrapper) Close() error {
 	c.closed = true
 	c.closedMu.Unlock()
 	if logger.IsLevelEnabled(logger.LevelDebug) {
-		logger.Debug("packetConnWrapper.Close: node=%s local=%v remote=%v stack=%s", c.nodeName, c.PacketConn.LocalAddr(), c.remoteAddr, strings.TrimSpace(string(debug.Stack())))
+		// 关闭 sing-box UDP 上游连接属于正常生命周期事件，不再输出完整调用栈，避免在 ACL 踢出等场景下制造“错误”假象。
+		logger.Debug("packetConnWrapper.Close: node=%s local=%v remote=%v", c.nodeName, c.PacketConn.LocalAddr(), c.remoteAddr)
 	}
 	return c.PacketConn.Close()
 }

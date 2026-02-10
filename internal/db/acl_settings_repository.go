@@ -17,7 +17,7 @@ func NewACLSettingsRepository(db *Database) *ACLSettingsRepository {
 }
 
 // Get retrieves ACL settings for a specific server (or global if serverID is empty).
-// If no settings exist, returns default settings.
+// Returns sql.ErrNoRows if no settings exist (to allow fallback to global settings).
 func (r *ACLSettingsRepository) Get(serverID string) (*ACLSettings, error) {
 	query := `
 		SELECT server_id, whitelist_enabled, default_ban_message, whitelist_message
@@ -34,10 +34,8 @@ func (r *ACLSettingsRepository) Get(serverID string) (*ACLSettings, error) {
 	err := row.Scan(&srvID, &whitelistEnabled, &defaultMsg, &whitelistMsg)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			// Return default settings if none exist
-			defaults := DefaultACLSettings()
-			defaults.ServerID = serverID
-			return defaults, nil
+			// Return error to allow caller to fallback to global settings
+			return nil, sql.ErrNoRows
 		}
 		return nil, fmt.Errorf("failed to get ACL settings: %w", err)
 	}
@@ -47,16 +45,19 @@ func (r *ACLSettingsRepository) Get(serverID string) (*ACLSettings, error) {
 	}
 	if whitelistEnabled.Valid {
 		settings.WhitelistEnabled = whitelistEnabled.Bool
+	} else {
+		// If whitelist_enabled is NULL, default to false
+		settings.WhitelistEnabled = false
 	}
 	if defaultMsg.Valid {
 		settings.DefaultMessage = defaultMsg.String
 	} else {
-		settings.DefaultMessage = "You are banned from this server"
+		settings.DefaultMessage = "你已被封禁"
 	}
 	if whitelistMsg.Valid {
 		settings.WhitelistMessage = whitelistMsg.String
 	} else {
-		settings.WhitelistMessage = "You are not whitelisted on this server"
+		settings.WhitelistMessage = "你不在白名单中"
 	}
 
 	return &settings, nil

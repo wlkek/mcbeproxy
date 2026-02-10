@@ -41,6 +41,7 @@ const (
 	Protocol        string `json:"protocol"`
 	Enabled         bool   `json:"enabled"`  // Whether to start the proxy listener
 	Disabled        bool   `json:"disabled"` // Whether to reject new connections (when enabled=true)
+	UDPSpeeder      *UDPSpeederConfig `json:"udp_speeder,omitempty"`
 	SendRealIP      bool   `json:"send_real_ip"`
 	ResolveInterval int    `json:"resolve_interval"`  // seconds
 	IdleTimeout     int    `json:"idle_timeout"`      // seconds
@@ -60,6 +61,81 @@ const (
 	AutoPingIntervalMinutes int  `json:"auto_ping_interval_minutes"` // Per-server ping interval in minutes
 	resolvedIP             string
 	lastResolved           time.Time
+}
+
+type UDPSpeederConfig struct {
+	Enabled         bool     `json:"enabled"`
+	BinaryPath      string   `json:"binary_path"`
+	LocalListenAddr string   `json:"local_listen_addr"`
+	RemoteAddr      string   `json:"remote_addr"`
+	FEC             string   `json:"fec"`
+	Key             string   `json:"key"`
+	Mode            int      `json:"mode"`
+	TimeoutMs       int      `json:"timeout_ms"`
+	MTU             int      `json:"mtu"`
+	DisableObscure  bool     `json:"disable_obscure"`
+	DisableChecksum bool     `json:"disable_checksum"`
+	ExtraArgs       []string `json:"extra_args"`
+}
+
+type UDPSpeederConfigDTO struct {
+	Enabled         bool     `json:"enabled"`
+	BinaryPath      string   `json:"binary_path"`
+	LocalListenAddr string   `json:"local_listen_addr"`
+	RemoteAddr      string   `json:"remote_addr"`
+	FEC             string   `json:"fec"`
+	Mode            int      `json:"mode"`
+	TimeoutMs       int      `json:"timeout_ms"`
+	MTU             int      `json:"mtu"`
+	DisableObscure  bool     `json:"disable_obscure"`
+	DisableChecksum bool     `json:"disable_checksum"`
+	ExtraArgs       []string `json:"extra_args"`
+}
+
+func (c *UDPSpeederConfig) ToDTO() *UDPSpeederConfigDTO {
+	if c == nil {
+		return nil
+	}
+	return &UDPSpeederConfigDTO{
+		Enabled:         c.Enabled,
+		BinaryPath:      c.BinaryPath,
+		LocalListenAddr: c.LocalListenAddr,
+		RemoteAddr:      c.RemoteAddr,
+		FEC:             c.FEC,
+		Mode:            c.Mode,
+		TimeoutMs:       c.TimeoutMs,
+		MTU:             c.MTU,
+		DisableObscure:  c.DisableObscure,
+		DisableChecksum: c.DisableChecksum,
+		ExtraArgs:       c.ExtraArgs,
+	}
+}
+
+func (c *UDPSpeederConfig) Validate() error {
+	if c == nil || !c.Enabled {
+		return nil
+	}
+	if c.RemoteAddr == "" {
+		return errors.New("udp_speeder.remote_addr is required when enabled")
+	}
+	if _, _, err := net.SplitHostPort(c.RemoteAddr); err != nil {
+		return fmt.Errorf("udp_speeder.remote_addr invalid: %w", err)
+	}
+	if c.LocalListenAddr != "" {
+		if _, _, err := net.SplitHostPort(c.LocalListenAddr); err != nil {
+			return fmt.Errorf("udp_speeder.local_listen_addr invalid: %w", err)
+		}
+	}
+	if c.Mode < 0 {
+		return errors.New("udp_speeder.mode cannot be negative")
+	}
+	if c.TimeoutMs < 0 {
+		return errors.New("udp_speeder.timeout_ms cannot be negative")
+	}
+	if c.MTU < 0 {
+		return errors.New("udp_speeder.mtu cannot be negative")
+	}
+	return nil
 }
 
 // GetProxyMode returns the proxy mode, defaulting to "transparent".
@@ -90,6 +166,15 @@ func (sc *ServerConfig) Validate() error {
 	}
 	if sc.Protocol == "" {
 		return errors.New("protocol is required")
+	}
+	if sc.UDPSpeeder != nil && sc.UDPSpeeder.Enabled {
+		switch strings.ToLower(sc.Protocol) {
+		case "tcp", "tcp_udp":
+			return fmt.Errorf("udp_speeder is not supported for protocol %s", sc.Protocol)
+		}
+		if err := sc.UDPSpeeder.Validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -143,6 +228,7 @@ func ServerConfigFromJSON(data []byte) (*ServerConfig, error) {
 	Protocol        string `json:"protocol"`
 	Enabled         bool   `json:"enabled"`
 	Disabled        bool   `json:"disabled"` // Whether to reject new connections
+	UDPSpeeder      *UDPSpeederConfigDTO `json:"udp_speeder,omitempty"`
 	SendRealIP      bool   `json:"send_real_ip"`
 	ResolveInterval int    `json:"resolve_interval"`
 	IdleTimeout     int    `json:"idle_timeout"`
@@ -174,6 +260,7 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		Protocol:        sc.Protocol,
 		Enabled:         sc.Enabled,
 		Disabled:        sc.Disabled,
+		UDPSpeeder:      sc.UDPSpeeder.ToDTO(),
 		SendRealIP:      sc.SendRealIP,
 		ResolveInterval: sc.ResolveInterval,
 		IdleTimeout:     sc.IdleTimeout,

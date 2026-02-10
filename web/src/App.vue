@@ -98,7 +98,7 @@ const menuOptions = [
   { label: '玩家', key: 'players', icon: renderIcon(PeopleOutline) },
   { label: '黑名单', key: 'blacklist', icon: renderIcon(BanOutline) },
   { label: '白名单', key: 'whitelist', icon: renderIcon(CheckmarkCircleOutline) },
-  { label: '会话', key: 'sessions', icon: renderIcon(TimeOutline) },
+  { label: '连接记录', key: 'sessions', icon: renderIcon(TimeOutline) },
   { label: '日志', key: 'logs', icon: renderIcon(DocumentTextOutline) },
   { label: '调试', key: 'debug', icon: renderIcon(BugOutline) },
   { label: '设置', key: 'settings', icon: renderIcon(SettingsOutline) }
@@ -133,10 +133,19 @@ const parseHash = () => {
   }
 }
 
+const MAX_QUERY_LENGTH = 128
+
+const normalizeQuery = (val) => {
+  if (typeof val !== 'string') return ''
+  const trimmed = val.trim()
+  return trimmed.length > MAX_QUERY_LENGTH ? trimmed.slice(0, MAX_QUERY_LENGTH) : trimmed
+}
+
 const navigateTo = (page, search, highlight, skipHash = false) => {
   const normalized = normalizePage(page)
-  searchParam.value = typeof search === 'string' ? search : ''
-  highlightParam.value = typeof highlight === 'string' ? highlight : ''
+  // 为避免 URL 过长，对前端跳转参数做长度上限裁剪
+  searchParam.value = normalizeQuery(search)
+  highlightParam.value = normalizeQuery(highlight)
   searchKey.value++
   currentPage.value = normalized
   if (!skipHash) {

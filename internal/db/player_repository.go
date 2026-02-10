@@ -52,39 +52,6 @@ func (r *PlayerRepository) GetByDisplayName(displayName string) (*PlayerRecord, 
 	return r.scanPlayerRecord(row)
 }
 
-// Update updates an existing player record.
-func (r *PlayerRepository) Update(pr *PlayerRecord) error {
-	query := `
-		UPDATE players 
-		SET uuid = ?, xuid = ?, last_seen = ?, total_bytes = ?, total_playtime = ?, metadata = ?
-		WHERE display_name = ?
-	`
-
-	result, err := r.db.DB().Exec(query,
-		pr.UUID,
-		pr.XUID,
-		pr.LastSeen,
-		pr.TotalBytes,
-		pr.TotalPlaytime,
-		pr.Metadata,
-		pr.DisplayName,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to update player: %w", err)
-	}
-
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get affected rows: %w", err)
-	}
-
-	if affected == 0 {
-		return sql.ErrNoRows
-	}
-
-	return nil
-}
-
 // List retrieves player records with pagination.
 func (r *PlayerRepository) List(limit, offset int) ([]*PlayerRecord, error) {
 	query := `
@@ -145,44 +112,6 @@ func (r *PlayerRepository) UpdateStats(displayName string, bytesAdded int64, pla
 	}
 
 	return nil
-}
-
-// GetOrCreate retrieves a player by display name, or creates a new record if not found.
-// Also updates UUID and XUID if they have changed.
-func (r *PlayerRepository) GetOrCreate(displayName, uuid, xuid string) (*PlayerRecord, error) {
-	pr, err := r.GetByDisplayName(displayName)
-	if err == nil {
-		// Update UUID and XUID if changed
-		if pr.UUID != uuid || pr.XUID != xuid {
-			pr.UUID = uuid
-			pr.XUID = xuid
-			pr.LastSeen = time.Now()
-			r.Update(pr)
-		}
-		return pr, nil
-	}
-
-	if err != sql.ErrNoRows {
-		return nil, err
-	}
-
-	// Create new player
-	now := time.Now()
-	newPlayer := &PlayerRecord{
-		DisplayName:   displayName,
-		UUID:          uuid,
-		XUID:          xuid,
-		FirstSeen:     now,
-		LastSeen:      now,
-		TotalBytes:    0,
-		TotalPlaytime: 0,
-	}
-
-	if err := r.Create(newPlayer); err != nil {
-		return nil, err
-	}
-
-	return newPlayer, nil
 }
 
 // scanPlayerRecord scans a single row into a PlayerRecord.

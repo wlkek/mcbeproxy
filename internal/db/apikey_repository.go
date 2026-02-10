@@ -117,11 +117,10 @@ func (r *APIKeyRepository) LogAccess(key, endpoint string) error {
 	}
 
 	// Cleanup old logs if needed
-	return r.CleanupLogs()
+	return r.cleanupLogs()
 }
 
-// CountAccessLogs returns the total number of access log records.
-func (r *APIKeyRepository) CountAccessLogs() (int, error) {
+func (r *APIKeyRepository) countAccessLogs() (int, error) {
 	var count int
 	err := r.db.DB().QueryRow("SELECT COUNT(*) FROM api_access_log").Scan(&count)
 	if err != nil {
@@ -130,8 +129,7 @@ func (r *APIKeyRepository) CountAccessLogs() (int, error) {
 	return count, nil
 }
 
-// DeleteOldestLogs deletes the oldest n access log records.
-func (r *APIKeyRepository) DeleteOldestLogs(count int) error {
+func (r *APIKeyRepository) deleteOldestLogs(count int) error {
 	query := `
 		DELETE FROM api_access_log WHERE id IN (
 			SELECT id FROM api_access_log ORDER BY timestamp ASC LIMIT ?
@@ -144,16 +142,15 @@ func (r *APIKeyRepository) DeleteOldestLogs(count int) error {
 	return nil
 }
 
-// CleanupLogs removes access log records exceeding the max limit.
-func (r *APIKeyRepository) CleanupLogs() error {
-	count, err := r.CountAccessLogs()
+func (r *APIKeyRepository) cleanupLogs() error {
+	count, err := r.countAccessLogs()
 	if err != nil {
 		return err
 	}
 
 	if count > r.maxLogRecords {
 		toDelete := count - r.maxLogRecords
-		return r.DeleteOldestLogs(toDelete)
+		return r.deleteOldestLogs(toDelete)
 	}
 
 	return nil
@@ -224,34 +221,4 @@ func (r *APIKeyRepository) scanAPIKeys(rows *sql.Rows) ([]*APIKey, error) {
 	}
 
 	return keys, nil
-}
-
-// GetAccessLogs retrieves access logs for a specific API key.
-func (r *APIKeyRepository) GetAccessLogs(key string, limit int) ([]*APIAccessLog, error) {
-	query := `
-		SELECT id, api_key, endpoint, timestamp
-		FROM api_access_log WHERE api_key = ? ORDER BY timestamp DESC LIMIT ?
-	`
-
-	rows, err := r.db.DB().Query(query, key, limit)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get access logs: %w", err)
-	}
-	defer rows.Close()
-
-	var logs []*APIAccessLog
-	for rows.Next() {
-		var log APIAccessLog
-		err := rows.Scan(&log.ID, &log.APIKey, &log.Endpoint, &log.Timestamp)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan access log: %w", err)
-		}
-		logs = append(logs, &log)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating access log rows: %w", err)
-	}
-
-	return logs, nil
 }

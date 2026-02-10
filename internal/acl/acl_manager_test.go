@@ -79,7 +79,7 @@ func TestProperty_BlacklistMembershipDeterminesAccessDenial(t *testing.T) {
 			// Verify: reason should match (or default if empty)
 			expectedReason := reason
 			if expectedReason == "" {
-				expectedReason = "You are banned from this server"
+				expectedReason = "你已被封禁"
 			}
 			if denialReason != expectedReason {
 				t.Logf("Expected reason %q, got %q", expectedReason, denialReason)

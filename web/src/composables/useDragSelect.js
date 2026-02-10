@@ -11,7 +11,6 @@ import { ref, onMounted, onUnmounted } from 'vue'
 export function useDragSelect(checkedKeys, rowKeyField = 'name') {
   const isDragging = ref(false)
   const initialCheckedState = ref(false)
-  const suppressNextSelectionClick = ref(false)
 
   const toggleSelection = (key, shouldSelect) => {
     const index = checkedKeys.value.indexOf(key)
@@ -24,17 +23,19 @@ export function useDragSelect(checkedKeys, rowKeyField = 'name') {
 
   const handleMouseDown = (rowKey, e) => {
     if (rowKey === undefined || rowKey === null) return
+    // 只在勾选框这一列启用拖选，避免误触
     const selectionCell = e.target.closest('.n-data-table-td--selection')
     if (!selectionCell) return
 
+    // 标记进入拖选状态，但不主动改动当前行的选中状态，
+    // 让 NaiveUI 自己处理这一次点击的勾选/取消，
+    // 我们只对「经过的其他行」做统一批量处理，避免双重切换导致状态错乱。
     isDragging.value = true
-    suppressNextSelectionClick.value = true
 
+    // 记录初始行的目标选中状态：
+    // - 如果一开始是未选中，则拖动经过的行统一改为“选中”
+    // - 如果一开始是已选中，则拖动经过的行统一改为“取消选中”
     initialCheckedState.value = !checkedKeys.value.includes(rowKey)
-    toggleSelection(rowKey, initialCheckedState.value)
-
-    e.preventDefault()
-    e.stopPropagation()
   }
 
   const handleMouseEnter = (rowKey) => {
@@ -46,22 +47,6 @@ export function useDragSelect(checkedKeys, rowKeyField = 'name') {
   const handleMouseUp = () => {
     if (!isDragging.value) return
     isDragging.value = false
-
-    // click 事件会发生在 mouseup 之后，这里延迟清理，避免双切换
-    setTimeout(() => {
-      suppressNextSelectionClick.value = false
-    }, 0)
-  }
-
-  const handleClickCapture = (e) => {
-    if (!suppressNextSelectionClick.value) return
-
-    const selectionCell = e.target.closest('.n-data-table-td--selection')
-    if (!selectionCell) return
-
-    suppressNextSelectionClick.value = false
-    e.preventDefault()
-    e.stopPropagation()
   }
 
   onMounted(() => {
@@ -77,8 +62,7 @@ export function useDragSelect(checkedKeys, rowKeyField = 'name') {
     return {
       'data-key': rowKey,
       onMousedown: (e) => handleMouseDown(rowKey, e),
-      onMouseenter: () => handleMouseEnter(rowKey),
-      onClickCapture: handleClickCapture
+      onMouseenter: () => handleMouseEnter(rowKey)
     }
   }
 

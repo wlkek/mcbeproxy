@@ -26,6 +26,17 @@ func NewSessionRepository(db *Database, maxRecords int) *SessionRepository {
 	}
 }
 
+// SetMaxRecords updates the maximum number of session records.
+// This will trigger a cleanup if the new limit is lower than the current count.
+func (r *SessionRepository) SetMaxRecords(maxRecords int) error {
+	if maxRecords <= 0 {
+		maxRecords = 100 // default
+	}
+	r.maxRecords = maxRecords
+	// Immediately cleanup if needed
+	return r.Cleanup()
+}
+
 // Create inserts a new session record into the database.
 func (r *SessionRepository) Create(sr *session.SessionRecord) error {
 	query := `

@@ -15,6 +15,7 @@ import (
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/monitor"
+	"mcpeserverproxy/internal/protocol"
 	"mcpeserverproxy/internal/session"
 
 	"github.com/sandertv/go-raknet"
@@ -39,6 +40,12 @@ type RakNetProxy struct {
 	// Context for background goroutines
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// ========== 连接追踪 ==========
+	// 为了在 ACL 拒绝时能够精确踢出对应玩家，并向其发送带理由的 Disconnect 包，
+	// 我们在 RakNet 模式下增加一个 clientAddr -> *raknet.Conn 的映射。
+	activeConns   map[string]*raknet.Conn
+	activeConnsMu sync.RWMutex
 }
 
 // NewRakNetProxy creates a new RakNet proxy for the specified server configuration.
@@ -49,10 +56,11 @@ func NewRakNetProxy(
 	sessionMgr *session.SessionManager,
 ) *RakNetProxy {
 	return &RakNetProxy{
-		serverID:   serverID,
-		config:     cfg,
-		configMgr:  configMgr,
-		sessionMgr: sessionMgr,
+		serverID:    serverID,
+		config:      cfg,
+		configMgr:   configMgr,
+		sessionMgr:  sessionMgr,
+		activeConns: make(map[string]*raknet.Conn),
 	}
 }
 
@@ -405,6 +413,16 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 
 	clientAddr := clientConn.RemoteAddr().String()
 
+	// 注册当前连接，便于 ACL 拒绝时精确踢出并发送带理由的 Disconnect 包
+	p.activeConnsMu.Lock()
+	p.activeConns[clientAddr] = clientConn
+	p.activeConnsMu.Unlock()
+	defer func() {
+		p.activeConnsMu.Lock()
+		delete(p.activeConns, clientAddr)
+		p.activeConnsMu.Unlock()
+	}()
+
 	// Check if server is enabled
 	serverCfg, exists := p.configMgr.GetServer(p.serverID)
 	if !exists || !serverCfg.Enabled {
@@ -591,13 +609,23 @@ func (p *RakNetProxy) forwardPacketsTracked(ctx context.Context, src, dst *rakne
 			} else {
 				sess.AddBytesDown(int64(n))
 				p.tryExtractPlayerInfoFromServer(sess, data)
-				// Try to detect and log disconnect packets from remote server
+
+				// 尝试解析远端 MCBE 断开/封禁原因
 				if disconnectMsg := p.tryParseDisconnectPacket(data); disconnectMsg != "" {
 					logger.Info("Remote server disconnect for %s: %s", sess.ClientAddr, disconnectMsg)
+
+					// 尝试主动向客户端发送一个带完整理由的 MCBE Disconnect 包
+					// 注意：在 RakNet 代理模式下，登录完成后的数据同样会被加密，
+					// 这里的做法只能在尚未开启加密/或服务端在登录阶段下发 Disconnect 时生效。
+					if err := p.sendDisconnect(dst, disconnectMsg); err != nil {
+						logger.Debug("Failed to send translated disconnect packet to client %s: %v", sess.ClientAddr, err)
+					}
+					// 发送完踢出提示后可以直接结束当前转发循环，让客户端尽快看到提示
+					return
 				}
 			}
 
-			// Forward packet
+			// 正常情况直接透明转发原始数据
 			_, err = dst.Write(data)
 			if err != nil {
 				return
@@ -633,14 +661,31 @@ func (p *RakNetProxy) searchForPlayerInfo(sess *session.Session, data []byte) {
 			logger.Info("Player identified: name=%s, client=%s", name, sess.ClientAddr)
 			sess.SetPlayerInfo("", name)
 
-			// Check ACL access control after player name is extracted
-			// Note: RakNet proxy cannot send disconnect packets directly,
-			// so we just log the denial. The MITM proxy should be used for
-			// proper access control with disconnect capability.
+			// 在 RakNet 模式下，同样在这里做 ACL 检查。
+			// 如果拒绝，则额外构造一个 MCBE Disconnect 包，把 ACL 返回的原因当作踢出文案发给客户端，
+			// 避免玩家只看到“断开与主机的连接”，无法知道是被封禁/未在白名单等原因。
 			if p.aclManager != nil {
 				allowed, reason := p.checkACLAccess(name, p.serverID, sess.ClientAddr)
 				if !allowed {
-					logger.Warn("RakNet proxy: ACL denied but cannot disconnect: player=%s, reason=%s", name, reason)
+					if reason == "" {
+						reason = "你已被封禁"
+					}
+					logger.Warn("RakNet proxy: ACL denied, will disconnect player=%s, reason=%s", name, reason)
+
+					// 尝试获取当前玩家对应的 RakNet 连接并发送 Disconnect
+					p.activeConnsMu.RLock()
+					conn := p.activeConns[sess.ClientAddr]
+					p.activeConnsMu.RUnlock()
+
+					if conn != nil {
+						if err := p.sendDisconnect(conn, reason); err != nil {
+							logger.Debug("Failed to send ACL disconnect packet to client %s: %v", sess.ClientAddr, err)
+						}
+						// 主动关闭连接，结束转发循环
+						_ = conn.Close()
+					} else {
+						logger.Debug("RakNet proxy: no active conn found for ACL-denied client %s", sess.ClientAddr)
+					}
 				}
 			}
 			return
@@ -871,4 +916,25 @@ func (p *RakNetProxy) parseDisconnectData(data []byte) string {
 	}
 
 	return message
+}
+
+// sendDisconnect 向客户端主动发送一个 MCBE Disconnect 数据包，携带远端服务端返回的封禁/踢出原因。
+// 注意：
+//   1. RakNet 模式下，MCBE 在登录完成后会开启加密通道，本方法只能在「未加密阶段的 Disconnect」
+//      或服务端在登录阶段下发的明文踢出包上生效。
+//   2. 即使客户端已经处于加密阶段，我们仍然尝试发送一次，失败会被捕获记录为调试日志，不影响现有连接关闭流程。
+func (p *RakNetProxy) sendDisconnect(conn *raknet.Conn, message string) error {
+	// 使用内部 protocol.Handler 构造一个标准 MCBE Disconnect 包（0xfe 包头 + 0x05 + 文本）。
+	// 这里直接构造明文游戏层数据并通过 RakNet 连接发送，由客户端自行解码显示。
+	handler := protocol.NewProtocolHandler()
+	pkt := handler.BuildDisconnectPacket(message)
+
+	if len(pkt) == 0 {
+		return fmt.Errorf("empty disconnect packet")
+	}
+
+	if _, err := conn.Write(pkt); err != nil {
+		return fmt.Errorf("write disconnect packet: %w", err)
+	}
+	return nil
 }

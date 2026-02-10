@@ -1635,11 +1635,13 @@ const importNodes = async () => {
   
   const groupName = importGroupName.value.trim()
   
-  let success = 0, failed = 0
+  let success = 0
+  const failedReasons = []
+  const invalidLinks = []
   for (const line of lines) {
     const config = parseLink(line)
     if (!config) {
-      failed++
+      invalidLinks.push(line)
       continue
     }
     
@@ -1648,15 +1650,55 @@ const importNodes = async () => {
       config.group = groupName
     }
     
-    const res = await api('/api/proxy-outbounds', 'POST', config)
-    if (res.success) success++
-    else failed++
+    try {
+      const res = await api('/api/proxy-outbounds', 'POST', config)
+      if (res && res.success) {
+        success++
+      } else {
+        failedReasons.push({
+          name: config.name || '未命名',
+          msg: (res && res.msg) || '导入失败'
+        })
+      }
+    } catch (e) {
+      failedReasons.push({
+        name: config.name || '未命名',
+        msg: (e && e.message) ? e.message : String(e)
+      })
+    }
   }
   
-  message.success(`导入完成: ${success} 成功, ${failed} 失败` + (groupName ? ` (分组: ${groupName})` : ''))
+  const failed = failedReasons.length + invalidLinks.length
+  const groupSuffix = groupName ? ` (分组: ${groupName})` : ''
+
+  if (failed === 0) {
+    message.success(`导入完成: ${success} 成功, ${failed} 失败${groupSuffix}`)
+  } else {
+    const maxShown = 6
+    const details = [
+      ...failedReasons.map(r => `${r.name}: ${r.msg}`),
+      ...invalidLinks.map(l => `无法识别链接: ${l.length > 120 ? l.slice(0, 120) + '…' : l}`)
+    ]
+    message.error(
+      () => h('div', { style: 'max-width: 520px' }, [
+        h('div', { style: 'font-weight: 600; margin-bottom: 6px' }, '导入失败'),
+        h('div', { style: 'margin-bottom: 8px' }, `成功 ${success}，失败 ${failed}${groupSuffix}`),
+        h('ol', { style: 'padding-left: 18px; margin: 0' }, details.slice(0, maxShown).map(item =>
+          h('li', { style: 'line-height: 1.4; margin: 0 0 4px' }, item)
+        )),
+        details.length > maxShown
+          ? h('div', { style: 'margin-top: 8px; opacity: 0.8' }, `还有 ${details.length - maxShown} 条失败原因未展示`)
+          : null
+      ]),
+      { duration: 10000 }
+    )
+  }
+
   if (success > 0) {
+    await load()
+  }
+  if (success > 0 && failed === 0) {
     showImportModal.value = false
-    load()
   }
 }
 

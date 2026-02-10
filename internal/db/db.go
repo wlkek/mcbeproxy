@@ -133,8 +133,8 @@ func (d *Database) Initialize() error {
 	CREATE TABLE IF NOT EXISTS acl_settings (
 		server_id TEXT PRIMARY KEY,
 		whitelist_enabled BOOLEAN DEFAULT FALSE,
-		default_ban_message TEXT DEFAULT 'You are banned from this server',
-		whitelist_message TEXT DEFAULT 'You are not whitelisted on this server'
+		default_ban_message TEXT DEFAULT '你已被封禁',
+		whitelist_message TEXT DEFAULT '你不在白名单中'
 	);
 	`
 

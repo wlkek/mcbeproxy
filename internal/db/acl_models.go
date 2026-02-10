@@ -89,8 +89,8 @@ func DefaultACLSettings() *ACLSettings {
 	return &ACLSettings{
 		ServerID:         "",
 		WhitelistEnabled: false,
-		DefaultMessage:   "You are banned from this server",
-		WhitelistMessage: "You are not whitelisted on this server",
+		DefaultMessage:   "你已被封禁",
+		WhitelistMessage: "你不在白名单中",
 	}
 }
 

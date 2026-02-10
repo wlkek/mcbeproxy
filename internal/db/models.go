@@ -2,7 +2,6 @@
 package db
 
 import (
-	"encoding/json"
 	"time"
 )
 
@@ -17,20 +16,6 @@ type PlayerRecord struct {
 	TotalBytes    int64     `json:"total_bytes"`
 	TotalPlaytime int64     `json:"total_playtime"` // seconds
 	Metadata      string    `json:"metadata,omitempty"`
-}
-
-// ToJSON serializes the player record to JSON.
-func (pr *PlayerRecord) ToJSON() ([]byte, error) {
-	return json.Marshal(pr)
-}
-
-// PlayerRecordFromJSON deserializes a player record from JSON.
-func PlayerRecordFromJSON(data []byte) (*PlayerRecord, error) {
-	var pr PlayerRecord
-	if err := json.Unmarshal(data, &pr); err != nil {
-		return nil, err
-	}
-	return &pr, nil
 }
 
 // PlayerDTO is the data transfer object for player API responses.
@@ -64,12 +49,4 @@ type APIKey struct {
 	CreatedAt time.Time `json:"created_at"`
 	LastUsed  time.Time `json:"last_used,omitempty"`
 	IsAdmin   bool      `json:"is_admin"`
-}
-
-// APIAccessLog represents an API access log entry.
-type APIAccessLog struct {
-	ID        int64     `json:"id"`
-	APIKey    string    `json:"api_key"`
-	Endpoint  string    `json:"endpoint"`
-	Timestamp time.Time `json:"timestamp"`
 }

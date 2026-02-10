@@ -38,15 +38,34 @@
     
     <!-- ACL 设置 -->
     <n-card title="访问控制 (ACL)" style="margin-bottom: 24px">
+      <n-alert type="info" style="margin-bottom: 16px">
+        这些设置将应用到所有服务器。黑名单提示消息用于封禁玩家时显示，白名单提示消息用于非白名单玩家连接时显示。
+      </n-alert>
       <n-space vertical size="large">
         <n-checkbox v-model:checked="aclSettings.whitelist_enabled">启用白名单模式</n-checkbox>
         <n-form-item label="黑名单提示消息">
-          <n-input v-model:value="aclSettings.blacklist_message" placeholder="你已被封禁" />
+          <n-input 
+            v-model:value="aclSettings.default_ban_message" 
+            placeholder="你已被封禁" 
+            :maxlength="200"
+            show-count
+          />
+          <template #feedback>
+            <n-text depth="3">当玩家被加入黑名单时，会显示此消息</n-text>
+          </template>
         </n-form-item>
         <n-form-item label="白名单提示消息">
-          <n-input v-model:value="aclSettings.whitelist_message" placeholder="你不在白名单中" />
+          <n-input 
+            v-model:value="aclSettings.whitelist_message" 
+            placeholder="你不在白名单中" 
+            :maxlength="200"
+            show-count
+          />
+          <template #feedback>
+            <n-text depth="3">当白名单模式启用且玩家不在白名单时，会显示此消息</n-text>
+          </template>
         </n-form-item>
-        <n-button type="primary" @click="saveACL">保存 ACL 设置</n-button>
+        <n-button type="primary" @click="saveACL" :loading="savingACL">保存 ACL 设置</n-button>
       </n-space>
     </n-card>
 
@@ -215,10 +234,12 @@ const updateEntryPath = async () => {
 }
 
 const aclSettings = reactive({
+  server_id: '', // 空字符串表示全局设置
   whitelist_enabled: false,
-  blacklist_message: '',
-  whitelist_message: ''
+  default_ban_message: '你已被封禁',
+  whitelist_message: '你不在白名单中'
 })
+const savingACL = ref(false)
 
 const config = reactive({
   api_port: 8080,
@@ -239,11 +260,24 @@ const config = reactive({
 })
 
 const loadConfig = async () => {
-  const [acl, cfg] = await Promise.all([api('/api/acl/settings'), api('/api/config')])
-  if (acl.success) Object.assign(aclSettings, acl.data)
-  if (cfg.success) {
-    Object.assign(config, cfg.data)
-    if (cfg.data.api_entry_path) entryPath.value = cfg.data.api_entry_path
+  try {
+    const [acl, cfg] = await Promise.all([
+      api('/api/acl/settings'), // 获取全局 ACL 设置（不传 server_id）
+      api('/api/config')
+    ])
+    if (acl.success && acl.data) {
+      // 确保字段名匹配后端返回的 DTO
+      aclSettings.server_id = acl.data.server_id || ''
+      aclSettings.whitelist_enabled = acl.data.whitelist_enabled || false
+      aclSettings.default_ban_message = acl.data.default_ban_message || '你已被封禁'
+      aclSettings.whitelist_message = acl.data.whitelist_message || '你不在白名单中'
+    }
+    if (cfg.success) {
+      Object.assign(config, cfg.data)
+      if (cfg.data.api_entry_path) entryPath.value = cfg.data.api_entry_path
+    }
+  } catch (err) {
+    message.error('加载配置失败: ' + (err.message || err))
   }
 }
 
@@ -253,9 +287,28 @@ onMounted(() => {
 })
 
 const saveACL = async () => {
-  const res = await api('/api/acl/settings', 'PUT', aclSettings)
-  if (res.success) message.success('ACL 设置已保存')
-  else message.error(res.error || '保存失败')
+  savingACL.value = true
+  try {
+    // 确保发送的数据格式与后端 DTO 一致
+    const payload = {
+      server_id: aclSettings.server_id || '', // 空字符串表示全局设置
+      whitelist_enabled: aclSettings.whitelist_enabled,
+      default_ban_message: aclSettings.default_ban_message || '你已被封禁',
+      whitelist_message: aclSettings.whitelist_message || '你不在白名单中'
+    }
+    const res = await api('/api/acl/settings', 'PUT', payload)
+    if (res.success) {
+      message.success('ACL 设置已保存')
+      // 重新加载以确保显示最新数据
+      await loadConfig()
+    } else {
+      message.error(res.msg || res.error || '保存失败')
+    }
+  } catch (err) {
+    message.error('保存 ACL 设置失败: ' + (err.message || err))
+  } finally {
+    savingACL.value = false
+  }
 }
 
 const saveConfigAndRestart = async () => {

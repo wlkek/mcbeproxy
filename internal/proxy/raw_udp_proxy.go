@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"mcpeserverproxy/internal/config"
+	"mcpeserverproxy/internal/db"
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/session"
 
@@ -205,6 +206,9 @@ type RawUDPProxy struct {
 // ACLManager interface for access control
 type ACLManager interface {
 	CheckAccess(playerName, serverID string) (allowed bool, reason string)
+	CheckAccessWithError(playerName, serverID string) (allowed bool, reason string, dbErr error)
+	IsBlacklisted(playerName, serverID string) (isBlacklisted bool, entry *db.BlacklistEntry)
+	GetSettings(serverID string) (*db.ACLSettings, error)
 }
 
 // NewRawUDPProxy creates a new raw UDP forwarding proxy.
@@ -1187,13 +1191,67 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 	// Check ACL (whitelist/blacklist) BEFORE forwarding Login packet
 	if p.aclManager != nil {
 		logger.Info("RawUDP ACL check: player=%s, serverID=%s", playerName, p.serverID)
-		allowed, reason := p.aclManager.CheckAccess(playerName, p.serverID)
+		
+		// First check if player is blacklisted
+		isBlacklisted, blacklistEntry := p.aclManager.IsBlacklisted(playerName, p.serverID)
+		if isBlacklisted && blacklistEntry != nil {
+			// 始终使用 ACL 设置中的 default_ban_message，忽略黑名单条目的自定义原因
+			settings, _ := p.aclManager.GetSettings(p.serverID)
+			var reason string
+			if settings != nil && settings.DefaultMessage != "" {
+				reason = settings.DefaultMessage
+			} else {
+				reason = "违反服务器规则"
+			}
+			// Format blacklist message - 换行显示玩家名字
+			formattedReason := fmt.Sprintf("§c黑名单用户\n§7玩家名字：%s\n§7原因：%s", playerName, reason)
+			logger.Info("Player %s blocked by blacklist (serverID=%s): %s", playerName, p.serverID, reason)
+			p.sendDisconnectToClient(clientInfo, formattedReason)
+			clientInfo.kicked.Store(true)
+			clientInfo.targetConn.Close()
+			return false // Player kicked
+		}
+
+		// Check access (includes whitelist check)
+		allowed, reason, dbErr := p.aclManager.CheckAccessWithError(playerName, p.serverID)
+		
+		// Log database errors if any
+		if dbErr != nil {
+			logger.LogACLCheckError(playerName, p.serverID, dbErr)
+		}
 
 		if !allowed {
-			logger.Info("Player %s blocked by ACL (serverID=%s): %s", playerName, p.serverID, reason)
+			// Check if this is a whitelist denial
+			settings, _ := p.aclManager.GetSettings(p.serverID)
+			var formattedReason string
+			if settings != nil && settings.WhitelistEnabled {
+				// 白名单拒绝：CheckAccessWithError 返回的 reason 已经是 WhitelistMessage
+				// 如果为空则从 ACL 设置获取
+				if reason == "" {
+					if settings.WhitelistMessage != "" {
+						reason = settings.WhitelistMessage
+					} else {
+						reason = "你不在白名单中"
+					}
+				}
+				// 添加玩家名字（始终添加，即使 reason 不为空）
+				// 使用与黑名单相同的格式，换行显示玩家名字
+				if playerName == "" {
+					playerName = "未知玩家"
+				}
+				formattedReason = fmt.Sprintf("§c%s\n§7玩家名: %s", reason, playerName)
+				logger.Info("Whitelist denial - message: %s, playerName: %s", formattedReason, playerName)
+			} else {
+				// Fallback to original reason
+				if reason == "" {
+					reason = "访问被拒绝"
+				}
+				formattedReason = "§c" + reason
+				logger.Info("Player %s blocked by ACL (serverID=%s): %s", playerName, p.serverID, reason)
+			}
 
 			// Send disconnect packet to client
-			p.sendDisconnectToClient(clientInfo, reason)
+			p.sendDisconnectToClient(clientInfo, formattedReason)
 
 			// Mark as kicked and close connection
 			clientInfo.kicked.Store(true)

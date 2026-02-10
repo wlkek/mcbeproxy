@@ -187,6 +187,7 @@ func (a *APIServer) setupRoutes() {
 		api.GET("/config", a.getConfig)
 		api.PUT("/config", a.updateConfig)
 		api.PUT("/config/entry-path", a.updateEntryPath)
+		api.PUT("/config/max-session-records", a.updateMaxSessionRecords)
 
 		// Goroutine management endpoints (for debugging)
 		debugGroup := api.Group("/debug")
@@ -794,7 +795,7 @@ type KickPlayerRequest struct {
 func (a *APIServer) kickPlayer(c *gin.Context) {
 	name := c.Param("name")
 	if name == "" {
-		respondError(c, http.StatusBadRequest, "Invalid request", "name parameter is required")
+		respondError(c, http.StatusBadRequest, "请求参数错误", "name 参数不能为空")
 		return
 	}
 
@@ -823,7 +824,7 @@ func (a *APIServer) kickPlayer(c *gin.Context) {
 func (a *APIServer) deletePlayer(c *gin.Context) {
 	name := c.Param("name")
 	if name == "" {
-		respondError(c, http.StatusBadRequest, "Invalid request", "name parameter is required")
+		respondError(c, http.StatusBadRequest, "请求参数错误", "name 参数不能为空")
 		return
 	}
 
@@ -1161,6 +1162,12 @@ func (a *APIServer) updateConfig(c *gin.Context) {
 	a.globalConfig.DebugMode = req.DebugMode
 	if req.MaxSessionRecords > 0 {
 		a.globalConfig.MaxSessionRecords = req.MaxSessionRecords
+		// Update SessionRepository immediately to apply the new limit
+		if a.sessionRepo != nil {
+			if err := a.sessionRepo.SetMaxRecords(req.MaxSessionRecords); err != nil {
+				fmt.Printf("Warning: failed to update session repository max records: %v\n", err)
+			}
+		}
 	}
 	if req.MaxAccessLogRecords > 0 {
 		a.globalConfig.MaxAccessLogRecords = req.MaxAccessLogRecords
@@ -1233,6 +1240,50 @@ func (a *APIServer) updateEntryPath(c *gin.Context) {
 	})
 }
 
+// updateMaxSessionRecords updates the maximum number of session records.
+// PUT /api/config/max-session-records
+func (a *APIServer) updateMaxSessionRecords(c *gin.Context) {
+	if a.globalConfig == nil {
+		respondError(c, http.StatusInternalServerError, "Config not available", "")
+		return
+	}
+
+	var req struct {
+		MaxSessionRecords int `json:"max_session_records"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	if req.MaxSessionRecords <= 0 {
+		respondError(c, http.StatusBadRequest, "Invalid max_session_records", "max_session_records must be greater than 0")
+		return
+	}
+
+	// Update config in memory
+	a.globalConfig.MaxSessionRecords = req.MaxSessionRecords
+
+	// Save config to file (using default path "config.json")
+	if err := a.globalConfig.Save("config.json"); err != nil {
+		fmt.Printf("Warning: failed to save config to file: %v\n", err)
+		// Continue anyway - config is updated in memory
+	}
+
+	// Update SessionRepository immediately to apply the new limit
+	if a.sessionRepo != nil {
+		if err := a.sessionRepo.SetMaxRecords(req.MaxSessionRecords); err != nil {
+			fmt.Printf("Warning: failed to update session repository max records: %v\n", err)
+			respondError(c, http.StatusInternalServerError, "Failed to update session repository", err.Error())
+			return
+		}
+	}
+
+	respondSuccessWithMsg(c, "最大连接记录数已更新", map[string]interface{}{
+		"max_session_records": req.MaxSessionRecords,
+	})
+}
+
 // getMetrics returns Prometheus metrics.
 // GET /metrics
 // Requirements: 6.7
@@ -1262,7 +1313,7 @@ func (a *APIServer) GetPrometheusMetrics() *monitor.PrometheusMetrics {
 // Requirements: 3.1
 func (a *APIServer) getBlacklist(c *gin.Context) {
 	if a.aclManager == nil {
-		respondError(c, http.StatusInternalServerError, "ACL manager not initialized", "")
+		respondError(c, http.StatusInternalServerError, "ACL 管理器未初始化", "")
 		return
 	}
 
@@ -1278,7 +1329,7 @@ func (a *APIServer) getBlacklist(c *gin.Context) {
 	}
 
 	if err != nil {
-		respondError(c, http.StatusInternalServerError, "Failed to get blacklist", err.Error())
+		respondError(c, http.StatusInternalServerError, "获取黑名单失败", err.Error())
 		return
 	}
 
@@ -1294,19 +1345,19 @@ func (a *APIServer) getBlacklist(c *gin.Context) {
 // Requirements: 3.2
 func (a *APIServer) addToBlacklist(c *gin.Context) {
 	if a.aclManager == nil {
-		respondError(c, http.StatusInternalServerError, "ACL manager not initialized", "")
+		respondError(c, http.StatusInternalServerError, "ACL 管理器未初始化", "")
 		return
 	}
 
 	var req db.AddBlacklistRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+		respondError(c, http.StatusBadRequest, "请求体格式错误", err.Error())
 		return
 	}
 
 	playerName := req.GetPlayerName()
 	if playerName == "" {
-		respondError(c, http.StatusBadRequest, "Invalid request body", "player_name is required")
+		respondError(c, http.StatusBadRequest, "请求体格式错误", "玩家名不能为空")
 		return
 	}
 
@@ -1320,7 +1371,7 @@ func (a *APIServer) addToBlacklist(c *gin.Context) {
 	}
 
 	if err := a.aclManager.AddToBlacklist(entry); err != nil {
-		respondError(c, http.StatusInternalServerError, "Failed to add to blacklist", err.Error())
+		respondError(c, http.StatusInternalServerError, "添加到黑名单失败", err.Error())
 		return
 	}
 
@@ -1342,13 +1393,13 @@ func (a *APIServer) addToBlacklist(c *gin.Context) {
 // Requirements: 3.3
 func (a *APIServer) removeFromBlacklist(c *gin.Context) {
 	if a.aclManager == nil {
-		respondError(c, http.StatusInternalServerError, "ACL manager not initialized", "")
+		respondError(c, http.StatusInternalServerError, "ACL 管理器未初始化", "")
 		return
 	}
 
 	name := c.Param("name")
 	if name == "" {
-		respondError(c, http.StatusBadRequest, "Invalid request", "name parameter is required")
+		respondError(c, http.StatusBadRequest, "请求参数错误", "name 参数不能为空")
 		return
 	}
 
@@ -1356,10 +1407,10 @@ func (a *APIServer) removeFromBlacklist(c *gin.Context) {
 
 	if err := a.aclManager.RemoveFromBlacklist(name, serverID); err != nil {
 		if err == sql.ErrNoRows {
-			respondError(c, http.StatusNotFound, "Entry not found", "No blacklist entry found with the specified name")
+			respondError(c, http.StatusNotFound, "未找到记录", "未找到指定名称的黑名单记录")
 			return
 		}
-		respondError(c, http.StatusInternalServerError, "Failed to remove from blacklist", err.Error())
+		respondError(c, http.StatusInternalServerError, "从黑名单移除失败", err.Error())
 		return
 	}
 
@@ -1372,7 +1423,7 @@ func (a *APIServer) removeFromBlacklist(c *gin.Context) {
 // Requirements: 3.4
 func (a *APIServer) getWhitelist(c *gin.Context) {
 	if a.aclManager == nil {
-		respondError(c, http.StatusInternalServerError, "ACL manager not initialized", "")
+		respondError(c, http.StatusInternalServerError, "ACL 管理器未初始化", "")
 		return
 	}
 
@@ -1388,7 +1439,7 @@ func (a *APIServer) getWhitelist(c *gin.Context) {
 	}
 
 	if err != nil {
-		respondError(c, http.StatusInternalServerError, "Failed to get whitelist", err.Error())
+		respondError(c, http.StatusInternalServerError, "获取白名单失败", err.Error())
 		return
 	}
 
@@ -1404,19 +1455,19 @@ func (a *APIServer) getWhitelist(c *gin.Context) {
 // Requirements: 3.5
 func (a *APIServer) addToWhitelist(c *gin.Context) {
 	if a.aclManager == nil {
-		respondError(c, http.StatusInternalServerError, "ACL manager not initialized", "")
+		respondError(c, http.StatusInternalServerError, "ACL 管理器未初始化", "")
 		return
 	}
 
 	var req db.AddWhitelistRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+		respondError(c, http.StatusBadRequest, "请求体格式错误", err.Error())
 		return
 	}
 
 	playerName := req.GetPlayerName()
 	if playerName == "" {
-		respondError(c, http.StatusBadRequest, "Invalid request body", "player_name is required")
+		respondError(c, http.StatusBadRequest, "请求体格式错误", "玩家名不能为空")
 		return
 	}
 
@@ -1428,7 +1479,7 @@ func (a *APIServer) addToWhitelist(c *gin.Context) {
 	}
 
 	if err := a.aclManager.AddToWhitelist(entry); err != nil {
-		respondError(c, http.StatusInternalServerError, "Failed to add to whitelist", err.Error())
+		respondError(c, http.StatusInternalServerError, "添加到白名单失败", err.Error())
 		return
 	}
 
@@ -1441,13 +1492,13 @@ func (a *APIServer) addToWhitelist(c *gin.Context) {
 // Requirements: 3.6
 func (a *APIServer) removeFromWhitelist(c *gin.Context) {
 	if a.aclManager == nil {
-		respondError(c, http.StatusInternalServerError, "ACL manager not initialized", "")
+		respondError(c, http.StatusInternalServerError, "ACL 管理器未初始化", "")
 		return
 	}
 
 	name := c.Param("name")
 	if name == "" {
-		respondError(c, http.StatusBadRequest, "Invalid request", "name parameter is required")
+		respondError(c, http.StatusBadRequest, "请求参数错误", "name 参数不能为空")
 		return
 	}
 
@@ -1455,10 +1506,10 @@ func (a *APIServer) removeFromWhitelist(c *gin.Context) {
 
 	if err := a.aclManager.RemoveFromWhitelist(name, serverID); err != nil {
 		if err == sql.ErrNoRows {
-			respondError(c, http.StatusNotFound, "Entry not found", "No whitelist entry found with the specified name")
+			respondError(c, http.StatusNotFound, "未找到记录", "未找到指定名称的白名单记录")
 			return
 		}
-		respondError(c, http.StatusInternalServerError, "Failed to remove from whitelist", err.Error())
+		respondError(c, http.StatusInternalServerError, "从白名单移除失败", err.Error())
 		return
 	}
 
@@ -1471,7 +1522,7 @@ func (a *APIServer) removeFromWhitelist(c *gin.Context) {
 // Requirements: 3.7
 func (a *APIServer) getACLSettings(c *gin.Context) {
 	if a.aclManager == nil {
-		respondError(c, http.StatusInternalServerError, "ACL manager not initialized", "")
+		respondError(c, http.StatusInternalServerError, "ACL 管理器未初始化", "")
 		return
 	}
 
@@ -1492,13 +1543,13 @@ func (a *APIServer) getACLSettings(c *gin.Context) {
 // Requirements: 3.8
 func (a *APIServer) updateACLSettings(c *gin.Context) {
 	if a.aclManager == nil {
-		respondError(c, http.StatusInternalServerError, "ACL manager not initialized", "")
+		respondError(c, http.StatusInternalServerError, "ACL 管理器未初始化", "")
 		return
 	}
 
 	var settingsDTO db.ACLSettingsDTO
 	if err := c.ShouldBindJSON(&settingsDTO); err != nil {
-		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+		respondError(c, http.StatusBadRequest, "请求体格式错误", err.Error())
 		return
 	}
 
@@ -1510,7 +1561,7 @@ func (a *APIServer) updateACLSettings(c *gin.Context) {
 	}
 
 	if err := a.aclManager.UpdateSettings(settings); err != nil {
-		respondError(c, http.StatusInternalServerError, "Failed to update ACL settings", err.Error())
+		respondError(c, http.StatusInternalServerError, "更新 ACL 设置失败", err.Error())
 		return
 	}
 

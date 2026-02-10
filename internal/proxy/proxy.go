@@ -601,29 +601,56 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 		return fmt.Errorf("listener for server %s already exists", serverCfg.ID)
 	}
 
+	cfgForListener := serverCfg
+	var cleanup func() error
+	if serverCfg.UDPSpeeder != nil && serverCfg.UDPSpeeder.Enabled {
+		proc, localAddr, err := startUDPSpeeder(serverCfg.ID, serverCfg)
+		if err != nil {
+			return err
+		}
+		if proc != nil {
+			_, portStr, err := net.SplitHostPort(localAddr)
+			if err != nil {
+				_ = proc.Stop()
+				return fmt.Errorf("udp_speeder local_listen_addr invalid: %w", err)
+			}
+			port, err := strconv.Atoi(portStr)
+			if err != nil {
+				_ = proc.Stop()
+				return fmt.Errorf("udp_speeder local_listen_addr invalid: %w", err)
+			}
+			cfgCopy := *serverCfg
+			cfgCopy.Target = "127.0.0.1"
+			cfgCopy.Port = port
+			cfgCopy.UDPSpeeder = nil
+			cfgForListener = &cfgCopy
+			cleanup = proc.Stop
+		}
+	}
+
 	var listener Listener
-	protocol := strings.ToLower(serverCfg.Protocol)
-	proxyMode := serverCfg.GetProxyMode()
+	protocol := strings.ToLower(cfgForListener.Protocol)
+	proxyMode := cfgForListener.GetProxyMode()
 
 	if protocol != "" && protocol != "raknet" {
 		switch protocol {
 		case "udp":
-			udpProxy := NewPlainUDPProxy(serverCfg.ID, serverCfg)
+			udpProxy := NewPlainUDPProxy(serverCfg.ID, cfgForListener)
 			if p.outboundMgr != nil {
 				udpProxy.SetOutboundManager(p.outboundMgr)
 			}
 			listener = udpProxy
 			logger.Info("Using plain UDP forwarding for server %s", serverCfg.ID)
 		case "tcp":
-			tcpProxy := NewPlainTCPProxy(serverCfg.ID, serverCfg)
+			tcpProxy := NewPlainTCPProxy(serverCfg.ID, cfgForListener)
 			if p.outboundMgr != nil {
 				tcpProxy.SetOutboundManager(p.outboundMgr)
 			}
 			listener = tcpProxy
 			logger.Info("Using plain TCP forwarding for server %s", serverCfg.ID)
 		case "tcp_udp":
-			udpProxy := NewPlainUDPProxy(serverCfg.ID, serverCfg)
-			tcpProxy := NewPlainTCPProxy(serverCfg.ID, serverCfg)
+			udpProxy := NewPlainUDPProxy(serverCfg.ID, cfgForListener)
+			tcpProxy := NewPlainTCPProxy(serverCfg.ID, cfgForListener)
 			if p.outboundMgr != nil {
 				udpProxy.SetOutboundManager(p.outboundMgr)
 				tcpProxy.SetOutboundManager(p.outboundMgr)
@@ -641,7 +668,7 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 			// Use MITM proxy with gophertunnel (full protocol access, requires proxy Xbox auth for auth servers)
 			mitmProxy := NewMITMProxy(
 				serverCfg.ID,
-				serverCfg,
+				cfgForListener,
 				p.configMgr,
 				p.sessionMgr,
 			)
@@ -655,7 +682,7 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 			// Use full RakNet proxy (can extract player info)
 			raknetProxy := NewRakNetProxy(
 				serverCfg.ID,
-				serverCfg,
+				cfgForListener,
 				p.configMgr,
 				p.sessionMgr,
 			)
@@ -673,7 +700,7 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 			// Use passthrough proxy (like gamma - forwards auth, extracts player info)
 			passthroughProxy := NewPassthroughProxy(
 				serverCfg.ID,
-				serverCfg,
+				cfgForListener,
 				p.configMgr,
 				p.sessionMgr,
 			)
@@ -699,7 +726,7 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 			// Use raw UDP forwarding proxy (no RakNet processing, pure UDP forwarding)
 			rawUDPProxy := NewRawUDPProxy(
 				serverCfg.ID,
-				serverCfg,
+				cfgForListener,
 				p.configMgr,
 				p.sessionMgr,
 			)
@@ -721,7 +748,7 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 			// Use transparent UDP proxy (default)
 			udpListener := NewUDPListener(
 				serverCfg.ID,
-				serverCfg,
+				cfgForListener,
 				p.bufferPool,
 				p.sessionMgr,
 				p.forwarder,
@@ -732,8 +759,15 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 		}
 	}
 
+	if cleanup != nil {
+		listener = &listenerWithCleanup{inner: listener, cleanup: cleanup}
+	}
+
 	// Start the listener
 	if err := listener.Start(); err != nil {
+		if cleanup != nil {
+			_ = cleanup()
+		}
 		return fmt.Errorf("failed to start listener: %w", err)
 	}
 
@@ -882,8 +916,19 @@ func (p *ProxyServer) Reload() error {
 					logger.Error("Failed to start listener for server %s: %v", serverCfg.ID, err)
 				}
 			} else {
-				// Existing server - check if config changed (especially proxy_outbound)
-				// Update the listener's config reference
+				existingKind := listenerKind(existingListener)
+				desiredKind := listenerKindFromConfig(serverCfg)
+				if existingKind != desiredKind {
+					if err := p.stopListener(serverCfg.ID); err != nil {
+						logger.Error("Failed to stop listener for server %s during restart: %v", serverCfg.ID, err)
+						continue
+					}
+					if err := p.startListener(serverCfg); err != nil {
+						logger.Error("Failed to restart listener for server %s: %v", serverCfg.ID, err)
+					}
+					continue
+				}
+
 				if updater, ok := existingListener.(interface{ UpdateConfig(*config.ServerConfig) }); ok {
 					updater.UpdateConfig(serverCfg)
 					logger.Debug("Updated config for server %s", serverCfg.ID)
@@ -894,6 +939,61 @@ func (p *ProxyServer) Reload() error {
 
 	logger.LogConfigReloaded(p.listenerCount())
 	return nil
+}
+
+func listenerKind(l Listener) string {
+	switch l.(type) {
+	case *PlainUDPProxy:
+		return "udp"
+	case *PlainTCPProxy:
+		return "tcp"
+	case *combinedListener:
+		return "tcp_udp"
+	case *MITMProxy:
+		return "mitm"
+	case *RakNetProxy:
+		return "raknet"
+	case *PassthroughProxy:
+		return "passthrough"
+	case *RawUDPProxy:
+		return "raw_udp"
+	case *UDPListener:
+		return "transparent"
+	default:
+		return fmt.Sprintf("%T", l)
+	}
+}
+
+func listenerKindFromConfig(serverCfg *config.ServerConfig) string {
+	if serverCfg == nil {
+		return ""
+	}
+	protocolValue := strings.ToLower(serverCfg.Protocol)
+	proxyMode := serverCfg.GetProxyMode()
+
+	if protocolValue != "" && protocolValue != "raknet" {
+		switch protocolValue {
+		case "udp":
+			return "udp"
+		case "tcp":
+			return "tcp"
+		case "tcp_udp":
+			return "tcp_udp"
+		}
+	}
+
+	switch proxyMode {
+	case "mitm":
+		return "mitm"
+	case "raknet":
+		return "raknet"
+	case "passthrough":
+		return "passthrough"
+	case "raw_udp":
+		return "raw_udp"
+	default:
+		return "transparent"
+	}
 }
 
 // ReloadProxyPorts reloads proxy port listeners based on current config.

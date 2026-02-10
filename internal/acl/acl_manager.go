@@ -10,6 +10,24 @@ import (
 	"mcpeserverproxy/internal/db"
 )
 
+// DenyType represents the type of access denial.
+type DenyType string
+
+const (
+	DenyNone      DenyType = ""
+	DenyBlacklist DenyType = "blacklist"
+	DenyWhitelist DenyType = "whitelist"
+	DenyACL       DenyType = "acl"
+)
+
+// AccessDecision represents the result of an access control check.
+type AccessDecision struct {
+	Allowed bool     `json:"allowed"`
+	Type    DenyType `json:"type"`
+	Reason  string   `json:"reason,omitempty"`
+	Detail  string   `json:"detail,omitempty"`
+}
+
 // ACLManager manages access control lists for blacklist and whitelist functionality.
 // It provides thread-safe access to ACL operations.
 type ACLManager struct {
@@ -96,89 +114,155 @@ func (m *ACLManager) CheckAccess(playerName, serverID string) (allowed bool, rea
 // This method implements fail-open behavior: if database errors occur,
 // access is allowed and the error is returned for logging (Requirement 5.4).
 func (m *ACLManager) CheckAccessWithError(playerName, serverID string) (allowed bool, reason string, dbErr error) {
+	decision, err := m.CheckAccessFull(playerName, serverID)
+	if err != nil {
+		// Fail-open: allow access on DB error
+		return true, "", err
+	}
+	return decision.Allowed, decision.Reason, nil
+}
+
+// CheckAccessFull performs a full access check and returns a structured decision.
+// It implements the following priority:
+// 1) Global blacklist
+// 2) Server-specific blacklist
+// 3) Whitelist (if enabled)
+// 4) Optional future ACL rules
+// On database errors, it returns Allowed=true (fail-open) and the error.
+func (m *ACLManager) CheckAccessFull(playerName, serverID string) (AccessDecision, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var lastErr error
 
-	// Step 1: Check global blacklist
+	// Helper to load ACL settings with fallback (server-specific -> global -> default)
+	loadSettings := func() *db.ACLSettings {
+		var settings *db.ACLSettings
+		if serverID != "" {
+			serverSettings, err := m.settingsRepo.Get(serverID)
+			if err != nil && err != ErrNotFound {
+				lastErr = err
+			}
+			if err == ErrNotFound || serverSettings == nil {
+				globalSettings, err2 := m.settingsRepo.Get("")
+				if err2 != nil && err2 != ErrNotFound {
+					lastErr = err2
+				}
+				if err2 == ErrNotFound || globalSettings == nil {
+					settings = db.DefaultACLSettings()
+				} else {
+					settings = globalSettings
+				}
+			} else {
+				settings = serverSettings
+			}
+		} else {
+			globalSettings, err := m.settingsRepo.Get("")
+			if err != nil && err != ErrNotFound {
+				lastErr = err
+			}
+			if err == ErrNotFound || globalSettings == nil {
+				settings = db.DefaultACLSettings()
+			} else {
+				settings = globalSettings
+			}
+		}
+		return settings
+	}
+
+	settings := loadSettings()
+
+	// Step 1: Global blacklist
 	entry, err := m.blacklistRepo.GetByName(playerName, "")
 	if err != nil && err != ErrNotFound {
 		lastErr = err
 	}
-	if err == nil && entry != nil {
-		if !entry.IsExpired() {
-			reason := entry.Reason
-			if reason == "" {
-				settings, _ := m.settingsRepo.Get("")
-				if settings != nil {
-					reason = settings.DefaultMessage
-				} else {
-					reason = "You are banned from this server"
-				}
-			}
-			return false, reason, nil
+	if err == nil && entry != nil && !entry.IsExpired() {
+		// 标题固定使用设置中的 DefaultMessage，如果为空则用默认文本
+		title := ""
+		if settings != nil {
+			title = strings.TrimSpace(settings.DefaultMessage)
 		}
+		if title == "" {
+			title = "你已被封禁"
+		}
+
+		// Detail 存放条目里的自定义原因
+		detail := strings.TrimSpace(entry.Reason)
+		if detail == "" {
+			detail = "无"
+		}
+
+		return AccessDecision{
+			Allowed: false,
+			Type:    DenyBlacklist,
+			Reason:  title,
+			Detail:  detail,
+		}, lastErr
 	}
 
-	// Step 2: Check server-specific blacklist
+	// Step 2: Server-specific blacklist
 	if serverID != "" {
 		entry, err = m.blacklistRepo.GetByName(playerName, serverID)
 		if err != nil && err != ErrNotFound {
 			lastErr = err
 		}
-		if err == nil && entry != nil {
-			if !entry.IsExpired() {
-				reason := entry.Reason
-				if reason == "" {
-					settings, _ := m.settingsRepo.Get(serverID)
-					if settings != nil {
-						reason = settings.DefaultMessage
-					} else {
-						reason = "You are banned from this server"
-					}
-				}
-				return false, reason, nil
+		if err == nil && entry != nil && !entry.IsExpired() {
+			reason := strings.TrimSpace(entry.Reason)
+			if reason == "" && settings != nil && strings.TrimSpace(settings.DefaultMessage) != "" {
+				reason = strings.TrimSpace(settings.DefaultMessage)
 			}
+			if reason == "" {
+				reason = "你已被封禁"
+			}
+			return AccessDecision{
+				Allowed: false,
+				Type:    DenyBlacklist,
+				Reason:  reason,
+				Detail:  entry.Reason,
+			}, lastErr
 		}
 	}
 
-	// Step 3: Get ACL settings for server
-	settings, err := m.settingsRepo.Get(serverID)
-	if err != nil && err != ErrNotFound {
-		lastErr = err
-	}
-	if err != nil || settings == nil {
-		settings = db.DefaultACLSettings()
+	// Step 3: Whitelist logic (if enabled)
+	if settings == nil || !settings.WhitelistEnabled {
+		return AccessDecision{Allowed: true, Type: DenyNone}, lastErr
 	}
 
-	// If whitelist is not enabled, allow access
-	if !settings.WhitelistEnabled {
-		return true, "", lastErr
-	}
-
-	// Step 4: Check global whitelist
+	// Global whitelist
 	whitelistEntry, err := m.whitelistRepo.GetByName(playerName, "")
 	if err != nil && err != ErrNotFound {
 		lastErr = err
 	}
 	if err == nil && whitelistEntry != nil {
-		return true, "", nil
+		return AccessDecision{Allowed: true, Type: DenyNone}, lastErr
 	}
 
-	// Step 5: Check server-specific whitelist
+	// Server-specific whitelist
 	if serverID != "" {
 		whitelistEntry, err = m.whitelistRepo.GetByName(playerName, serverID)
 		if err != nil && err != ErrNotFound {
 			lastErr = err
 		}
 		if err == nil && whitelistEntry != nil {
-			return true, "", nil
+			return AccessDecision{Allowed: true, Type: DenyNone}, lastErr
 		}
 	}
 
-	// Step 6: Deny with whitelist message
-	return false, settings.WhitelistMessage, lastErr
+	// Step 4: Whitelist denial
+	whitelistMsg := ""
+	if settings != nil {
+		whitelistMsg = strings.TrimSpace(settings.WhitelistMessage)
+	}
+	if whitelistMsg == "" {
+		whitelistMsg = "你不在白名单中"
+	}
+
+	return AccessDecision{
+		Allowed: false,
+		Type:    DenyWhitelist,
+		Reason:  whitelistMsg,
+	}, lastErr
 }
 
 // GetSettings retrieves ACL settings for a specific server.
@@ -307,7 +391,7 @@ func CheckAccessWithEntries(
 		if IsBlacklistedByEntry(playerName, entry) {
 			reason := entry.Reason
 			if reason == "" {
-				reason = "You are banned from this server"
+				reason = "你已被封禁"
 			}
 			return false, reason
 		}
@@ -318,7 +402,7 @@ func CheckAccessWithEntries(
 		if IsBlacklistedByEntry(playerName, entry) {
 			reason := entry.Reason
 			if reason == "" {
-				reason = "You are banned from this server"
+				reason = "你已被封禁"
 			}
 			return false, reason
 		}
@@ -346,7 +430,7 @@ func CheckAccessWithEntries(
 	// Step 6: Deny with whitelist message
 	whitelistMsg := settings.WhitelistMessage
 	if whitelistMsg == "" {
-		whitelistMsg = "You are not whitelisted on this server"
+		whitelistMsg = "你不在白名单中"
 	}
 	return false, whitelistMsg
 }
@@ -394,3 +478,4 @@ type ACLManagerInterface interface {
 
 // Ensure sql.ErrNoRows is available for error checking
 var ErrNotFound = sql.ErrNoRows
+

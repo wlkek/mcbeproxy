@@ -166,37 +166,14 @@ func (p *PassthroughProxy) UpdateConfig(cfg *config.ServerConfig) {
 
 // Start begins listening for RakNet connections.
 func (p *PassthroughProxy) Start() error {
-	useRawCompat := p.outboundMgr != nil && p.config != nil && !p.config.IsDirectConnection()
-	p.useRawCompat = useRawCompat
-	if useRawCompat {
-		if p.rawCompat == nil {
-			p.rawCompat = NewRawUDPProxy(p.serverID, p.config, p.configMgr, p.sessionMgr)
-			if p.aclManager != nil {
-				p.rawCompat.SetACLManager(p.aclManager)
-			}
-			if p.externalVerifier != nil {
-				p.rawCompat.SetExternalVerifier(p.externalVerifier)
-			}
-			p.rawCompat.SetOutboundManager(p.outboundMgr)
-			if p.passthroughIdleTimeoutOverride > 0 {
-				p.rawCompat.SetPassthroughIdleTimeoutOverride(p.passthroughIdleTimeoutOverride)
-			}
-		} else {
-			p.rawCompat.UpdateConfig(p.config)
-			if p.aclManager != nil {
-				p.rawCompat.SetACLManager(p.aclManager)
-			}
-			if p.externalVerifier != nil {
-				p.rawCompat.SetExternalVerifier(p.externalVerifier)
-			}
-			p.rawCompat.SetOutboundManager(p.outboundMgr)
-			if p.passthroughIdleTimeoutOverride > 0 {
-				p.rawCompat.SetPassthroughIdleTimeoutOverride(p.passthroughIdleTimeoutOverride)
-			}
-		}
-		logger.Info("Passthrough proxy using raw UDP compatible forwarding for server %s", p.serverID)
-		return p.rawCompat.Start()
-	}
+	// 旧版本在存在 proxy_outbound 时会切换到 RawUDPProxy 兼容模式（useRawCompat=true），
+	// 这样虽然可以通过 sing-box 转发，但会失去对 MCBE 协议层的精细控制，
+	// 无法在 ACL 拒绝时向客户端返回带中文原因的 Disconnect 提示。
+	//
+	// 为了满足「同一端口内：ACL 拒绝直接本地踢出并展示 ban 理由，ACL 通过则正常走上游代理」的需求，
+	// 这里强制始终使用基于 go-raknet 的 PassthroughProxy 流程，
+	// 上游代理通过 ProxyDialer 集成在 handleConnection 中完成。
+	p.useRawCompat = false
 
 	listener, err := raknet.Listen(p.config.ListenAddr)
 	if err != nil {
@@ -629,17 +606,19 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 	var remoteConn *raknet.Conn
 
 	// Check if we should use proxy outbound
+	var proxyDialer *ProxyDialer
+	var selectedNodeName string
 	if p.outboundMgr != nil && !serverCfg.IsDirectConnection() {
-		proxyDialer := NewProxyDialer(p.outboundMgr, serverCfg, 15*time.Second)
+		proxyDialer = NewProxyDialer(p.outboundMgr, serverCfg, 15*time.Second)
 		dialer := raknet.Dialer{
 			UpstreamDialer: proxyDialer,
 		}
 		proxyConfig := serverCfg.GetProxyOutbound()
 		if strings.Contains(proxyConfig, ",") {
 			nodeCount := len(strings.Split(proxyConfig, ","))
-			logger.Info("Connecting to remote %s via node-list (%d nodes)", targetAddr, nodeCount)
+			logger.Info("Connecting to remote %s via node-list (selecting 1 from %d nodes)", targetAddr, nodeCount)
 		} else if strings.HasPrefix(proxyConfig, "@") {
-			logger.Info("Connecting to remote %s via group %s", targetAddr, proxyConfig)
+			logger.Info("Connecting to remote %s via group %s (selecting 1 node)", targetAddr, proxyConfig)
 		} else {
 			logger.Info("Connecting to remote %s via node '%s'", targetAddr, proxyConfig)
 		}
@@ -647,10 +626,12 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 		remoteConn, err = dialer.Dial(targetAddr)
 		if err != nil {
 			logger.Error("RakNet dial via proxy failed: %v", err)
+			// Get the actual selected node (even if failed, it might have tried one)
+			selectedNodeName = proxyDialer.GetSelectedNode()
 		} else {
-			selectedNode := proxyDialer.GetSelectedNode()
-			if selectedNode != "" {
-				logger.Info("RakNet connection established via proxy '%s' to %s", selectedNode, targetAddr)
+			selectedNodeName = proxyDialer.GetSelectedNode()
+			if selectedNodeName != "" {
+				logger.Info("RakNet connection established via proxy '%s' to %s", selectedNodeName, targetAddr)
 			} else {
 				logger.Info("RakNet connection established via proxy to %s", targetAddr)
 			}
@@ -662,12 +643,40 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 
 	if err != nil {
 		if !serverCfg.IsDirectConnection() {
-			logger.Warn("Failed to connect to remote %s via proxy %s: %v", targetAddr, serverCfg.GetProxyOutbound(), err)
+			// Use actual selected node name if available, otherwise fall back to config
+			nodeDisplay := selectedNodeName
+			if nodeDisplay == "" {
+				nodeDisplay = serverCfg.GetProxyOutbound()
+			}
+			logger.Warn("Failed to connect to remote %s via proxy %s: %v", targetAddr, nodeDisplay, err)
 		} else {
 			logger.Error("Failed to connect to remote %s: %v", targetAddr, err)
 		}
-		// Send a simple disconnect - we can't use sendDisconnect here as compression isn't set up yet
-		// Just close the connection, client will see "Unable to connect to world"
+
+		// 此时 ProxyDialer/OutboundManager 已经尝试了多次节点/直连仍然失败，
+		// 向客户端发送一个带原因的断开提示，而不是单纯超时。
+		var nodeDisplay string
+		if !serverCfg.IsDirectConnection() {
+			// Use actual selected node name if available, otherwise fall back to config
+			if selectedNodeName != "" {
+				nodeDisplay = selectedNodeName
+			} else {
+				nodeDisplay = serverCfg.GetProxyOutbound()
+			}
+		} else {
+			nodeDisplay = "直连"
+		}
+		
+		reason := fmt.Sprintf(
+			"§c出口节点 / 远程服务器连接失败\n§7目标: %s\n§7节点: %s\n§7错误: %v",
+			targetAddr,
+			nodeDisplay,
+			err,
+		)
+
+		// 这里还没协商压缩/加密，传入 nil 让 sendDisconnect 尝试多种方式发送，
+		// 即使客户端忽略该包，最坏情况也与之前一样只是连接失败。
+		p.sendDisconnect(clientConn, reason, nil)
 		return
 	}
 	defer remoteConn.Close()
@@ -739,10 +748,40 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 
 		// Check ACL access control (Requirements 5.1, 5.2, 5.3, 5.4)
 		if p.aclManager != nil {
-			allowed, reason := p.checkACLAccess(playerName, p.serverID, clientAddr)
-			if !allowed {
+			decision, _ := p.checkACLAccess(playerName, p.serverID, clientAddr)
+			if !decision.Allowed {
+				// Format the denial message based on decision type
+				var formattedReason string
+				if playerName == "" {
+					playerName = "未知玩家"
+				}
+				switch decision.Type {
+				case acl.DenyBlacklist:
+					title := strings.TrimSpace(decision.Reason)
+					if title == "" {
+						title = "你已被封禁"
+					}
+					detail := strings.TrimSpace(decision.Detail)
+					if detail == "" {
+						detail = "无"
+					}
+					formattedReason = fmt.Sprintf("§c%s\n§7玩家名: %s\n§7原因: %s", title, playerName, detail)
+				case acl.DenyWhitelist:
+					reason := decision.Reason
+					if reason == "" {
+						reason = "你不在白名单中"
+					}
+					formattedReason = fmt.Sprintf("§c%s\n§7玩家名: %s", reason, playerName)
+				default:
+					reason := decision.Reason
+					if reason == "" {
+						reason = "访问被拒绝"
+					}
+					formattedReason = fmt.Sprintf("§c%s\n§7玩家名: %s", reason, playerName)
+				}
+				logger.Info("ACL denial - type=%s, player=%s, reason=%s", decision.Type, playerName, decision.Reason)
 				// Send disconnect packet with denial reason (Requirement 5.2)
-				p.sendDisconnect(clientConn, reason, compression)
+				p.sendDisconnect(clientConn, formattedReason, compression)
 				return
 			}
 		}
@@ -1330,42 +1369,35 @@ func readVaruint32(r io.ByteReader, x *uint32) error {
 	return fmt.Errorf("varuint32 did not terminate after 5 bytes")
 }
 
-// checkACLAccess checks if a player is allowed to access the server.
-// It implements fail-open behavior: if database errors occur, access is allowed.
+// checkACLAccess checks if a player is allowed to access the server using ACLManager.CheckAccessFull.
+// It implements fail-open behavior: if database errors occur, access is allowed and the error is logged.
+// Returns: AccessDecision from ACL plus any DB error (for logging).
 // Requirements: 5.1, 5.2, 5.3, 5.4
-func (p *PassthroughProxy) checkACLAccess(playerName, serverID, clientAddr string) (allowed bool, reason string) {
+func (p *PassthroughProxy) checkACLAccess(playerName, serverID, clientAddr string) (decision acl.AccessDecision, dbErr error) {
 	// Use defer/recover to handle any panics from ACL manager
 	defer func() {
 		if r := recover(); r != nil {
 			// Requirement 5.4: Database error - default allow and log warning
 			logger.LogACLCheckError(playerName, serverID, r)
-			allowed = true
-			reason = ""
+			decision = acl.AccessDecision{Allowed: true, Type: acl.DenyNone}
 		}
 	}()
 
-	// Call ACL manager to check access with error reporting
-	var dbErr error
-	allowed, reason, dbErr = p.aclManager.CheckAccessWithError(playerName, serverID)
+	if p.aclManager == nil {
+		return acl.AccessDecision{Allowed: true, Type: acl.DenyNone}, nil
+	}
 
-	// Requirement 5.4: Log warning if database error occurred
+	decision, dbErr = p.aclManager.CheckAccessFull(playerName, serverID)
 	if dbErr != nil {
 		logger.LogACLCheckError(playerName, serverID, dbErr)
 	}
 
-	if !allowed {
-		// Requirement 5.3: Log the denial event with player info and reason
-		logger.LogAccessDenied(playerName, serverID, clientAddr, reason)
-
-		// Format the reason with Minecraft color codes for better display
-		if reason == "" {
-			reason = "§cAccess denied"
-		} else {
-			reason = "§c" + reason
-		}
+	if !decision.Allowed {
+		// Log with structured type
+		logger.LogAccessDenied(playerName, serverID, clientAddr, string(decision.Type)+": "+decision.Reason)
 	}
 
-	return allowed, reason
+	return decision, dbErr
 }
 
 // sendDisconnect sends a disconnect packet to the client.

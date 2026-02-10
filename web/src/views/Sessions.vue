@@ -1,7 +1,7 @@
 <template>
   <div class="page-container">
     <n-space justify="space-between" align="center" style="margin-bottom: 16px">
-      <n-h2 style="margin: 0">会话记录</n-h2>
+      <n-h2 style="margin: 0">连接记录</n-h2>
       <n-space>
         <n-input v-model:value="search" placeholder="搜索玩家名" style="width: 180px" clearable @keyup.enter="load" />
         <n-button @click="load">搜索</n-button>
@@ -12,6 +12,30 @@
         </n-popconfirm>
       </n-space>
     </n-space>
+    <n-card style="margin-bottom: 16px">
+      <n-space align="center" justify="space-between">
+        <n-space align="center">
+          <n-text>最大连接记录数：</n-text>
+          <n-input-number 
+            v-model:value="maxSessionRecords" 
+            :min="10" 
+            :max="100000" 
+            :step="10"
+            style="width: 120px"
+            :loading="updatingMaxRecords"
+          />
+          <n-button 
+            type="primary" 
+            size="small" 
+            @click="updateMaxSessionRecords"
+            :loading="updatingMaxRecords"
+          >
+            保存
+          </n-button>
+        </n-space>
+        <n-text depth="3">当前限制：最多保留 {{ maxSessionRecords }} 条连接记录</n-text>
+      </n-space>
+    </n-card>
     <n-card>
       <div class="table-wrapper">
         <n-data-table 
@@ -36,6 +60,8 @@ import { api, formatTime, formatBytes, formatDuration } from '../api'
 const props = defineProps({ initialSearch: { type: String, default: '' } })
 const message = useMessage()
 const sessions = ref([])
+const maxSessionRecords = ref(100)
+const updatingMaxRecords = ref(false)
 const pagination = ref({
   page: 1,
   pageSize: 100,
@@ -75,7 +101,8 @@ const load = async () => {
   let url = '/api/sessions/history'
   const s = (search.value || '').trim()
   if (s) {
-    url += '?player_name=' + encodeURIComponent(s)
+    // 后端使用 player 查询参数
+    url += '?player=' + encodeURIComponent(s)
   }
   const res = await api(url)
   if (res.success) sessions.value = res.data || []
@@ -99,7 +126,42 @@ const clearAll = async () => {
   else message.error(res.error || '清空失败')
 }
 
-onMounted(load)
+const loadMaxSessionRecords = async () => {
+  const res = await api('/api/config')
+  if (res.success && res.data && res.data.max_session_records) {
+    maxSessionRecords.value = res.data.max_session_records
+  }
+}
+
+const updateMaxSessionRecords = async () => {
+  if (maxSessionRecords.value < 10) {
+    message.error('最大记录数不能小于 10')
+    return
+  }
+  updatingMaxRecords.value = true
+  try {
+    const res = await api('/api/config/max-session-records', 'PUT', {
+      max_session_records: maxSessionRecords.value
+    })
+    if (res.success) {
+      message.success(`最大连接记录数已更新为 ${maxSessionRecords.value}`)
+    } else {
+      message.error(res.msg || res.error || '更新失败')
+      // 恢复原值
+      await loadMaxSessionRecords()
+    }
+  } catch (err) {
+    message.error('更新失败: ' + (err.message || err))
+    await loadMaxSessionRecords()
+  } finally {
+    updatingMaxRecords.value = false
+  }
+}
+
+onMounted(() => {
+  load()
+  loadMaxSessionRecords()
+})
 </script>
 
 <style scoped>
