@@ -415,19 +415,27 @@ func (h *ProxyOutboundHandler) recordOutboundLatency(name, sortBy string, latenc
 }
 
 type ProxySubscriptionDTO struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	URL           string `json:"url"`
-	Enabled       bool   `json:"enabled"`
-	Group         string `json:"group,omitempty"`
-	ProxyName     string `json:"proxy_name,omitempty"`
-	UserAgent     string `json:"user_agent,omitempty"`
-	LastUpdatedAt string `json:"last_updated_at,omitempty"`
-	LastNodeCount int    `json:"last_node_count,omitempty"`
-	LastAdded     int    `json:"last_added,omitempty"`
-	LastUpdated   int    `json:"last_updated,omitempty"`
-	LastRemoved   int    `json:"last_removed,omitempty"`
-	LastError     string `json:"last_error,omitempty"`
+	ID                            string `json:"id"`
+	Name                          string `json:"name"`
+	URL                           string `json:"url"`
+	Enabled                       bool   `json:"enabled"`
+	Group                         string `json:"group,omitempty"`
+	ProxyName                     string `json:"proxy_name,omitempty"`
+	UserAgent                     string `json:"user_agent,omitempty"`
+	AutoUpdateEnabled             bool   `json:"auto_update_enabled"`
+	AutoUpdateMode                string `json:"auto_update_mode,omitempty"`
+	AutoUpdateTime                string `json:"auto_update_time,omitempty"`
+	AutoUpdateIntervalDays        int    `json:"auto_update_interval_days,omitempty"`
+	LastUpdatedAt                 string `json:"last_updated_at,omitempty"`
+	LastNodeCount                 int    `json:"last_node_count,omitempty"`
+	LastAdded                     int    `json:"last_added,omitempty"`
+	LastUpdated                   int    `json:"last_updated,omitempty"`
+	LastRemoved                   int    `json:"last_removed,omitempty"`
+	LastSubscriptionUploadBytes   int64  `json:"last_subscription_upload_bytes,omitempty"`
+	LastSubscriptionDownloadBytes int64  `json:"last_subscription_download_bytes,omitempty"`
+	LastSubscriptionTotalBytes    int64  `json:"last_subscription_total_bytes,omitempty"`
+	LastSubscriptionExpireAt      string `json:"last_subscription_expire_at,omitempty"`
+	LastError                     string `json:"last_error,omitempty"`
 }
 
 type ServerNodeLatencyHistoryItem struct {
@@ -553,13 +561,17 @@ func (h *ProxyOutboundHandler) buildProxyOutboundLatencyHistorySnapshot(outbound
 }
 
 type ProxySubscriptionRequest struct {
-	ID        string `json:"id,omitempty"`
-	Name      string `json:"name" binding:"required"`
-	URL       string `json:"url" binding:"required"`
-	Enabled   *bool  `json:"enabled,omitempty"`
-	Group     string `json:"group,omitempty"`
-	ProxyName string `json:"proxy_name,omitempty"`
-	UserAgent string `json:"user_agent,omitempty"`
+	ID                     string `json:"id,omitempty"`
+	Name                   string `json:"name" binding:"required"`
+	URL                    string `json:"url" binding:"required"`
+	Enabled                *bool  `json:"enabled,omitempty"`
+	Group                  string `json:"group,omitempty"`
+	ProxyName              string `json:"proxy_name,omitempty"`
+	UserAgent              string `json:"user_agent,omitempty"`
+	AutoUpdateEnabled      *bool  `json:"auto_update_enabled,omitempty"`
+	AutoUpdateMode         string `json:"auto_update_mode,omitempty"`
+	AutoUpdateTime         string `json:"auto_update_time,omitempty"`
+	AutoUpdateIntervalDays int    `json:"auto_update_interval_days,omitempty"`
 }
 
 type proxySubscriptionUpdateRequest struct {
@@ -634,42 +646,108 @@ func (r *ProxySubscriptionRequest) toConfig(existing *config.ProxySubscription) 
 		enabled = true
 	}
 	cfg := &config.ProxySubscription{
-		ID:        strings.TrimSpace(r.ID),
-		Name:      strings.TrimSpace(r.Name),
-		URL:       strings.TrimSpace(r.URL),
-		Enabled:   enabled,
-		Group:     strings.TrimSpace(r.Group),
-		ProxyName: strings.TrimSpace(r.ProxyName),
-		UserAgent: strings.TrimSpace(r.UserAgent),
+		ID:                     strings.TrimSpace(r.ID),
+		Name:                   strings.TrimSpace(r.Name),
+		URL:                    strings.TrimSpace(r.URL),
+		Enabled:                enabled,
+		Group:                  strings.TrimSpace(r.Group),
+		ProxyName:              strings.TrimSpace(r.ProxyName),
+		UserAgent:              strings.TrimSpace(r.UserAgent),
+		AutoUpdateEnabled:      r.AutoUpdateEnabled,
+		AutoUpdateMode:         strings.TrimSpace(r.AutoUpdateMode),
+		AutoUpdateTime:         strings.TrimSpace(r.AutoUpdateTime),
+		AutoUpdateIntervalDays: r.AutoUpdateIntervalDays,
 	}
 	if existing != nil {
+		if cfg.AutoUpdateEnabled == nil && existing.AutoUpdateEnabled != nil {
+			enabled := *existing.AutoUpdateEnabled
+			cfg.AutoUpdateEnabled = &enabled
+		}
+		if cfg.AutoUpdateMode == "" {
+			cfg.AutoUpdateMode = existing.AutoUpdateMode
+		}
+		if cfg.AutoUpdateTime == "" {
+			cfg.AutoUpdateTime = existing.AutoUpdateTime
+		}
+		if cfg.AutoUpdateIntervalDays <= 0 {
+			cfg.AutoUpdateIntervalDays = existing.AutoUpdateIntervalDays
+		}
+		cfg.AutoUpdateLastAttemptAt = existing.AutoUpdateLastAttemptAt
 		cfg.LastUpdatedAt = existing.LastUpdatedAt
 		cfg.LastNodeCount = existing.LastNodeCount
 		cfg.LastAdded = existing.LastAdded
 		cfg.LastUpdated = existing.LastUpdated
 		cfg.LastRemoved = existing.LastRemoved
+		cfg.LastSubscriptionUploadBytes = existing.LastSubscriptionUploadBytes
+		cfg.LastSubscriptionDownloadBytes = existing.LastSubscriptionDownloadBytes
+		cfg.LastSubscriptionTotalBytes = existing.LastSubscriptionTotalBytes
+		cfg.LastSubscriptionExpireAt = existing.LastSubscriptionExpireAt
 		cfg.LastError = existing.LastError
 	}
 	return cfg
 }
 
+func markProxySubscriptionManualSave(cfg *config.ProxySubscription, savedAt time.Time) {
+	if cfg == nil || !cfg.IsAutoUpdateEnabled() {
+		return
+	}
+	if savedAt.IsZero() {
+		savedAt = time.Now()
+	}
+	cfg.AutoUpdateLastAttemptAt = savedAt
+}
+
+func applyProxySubscriptionUpdateResult(cfg *config.ProxySubscription, result *subscription.UpdateResult, updatedAt time.Time) {
+	if cfg == nil || result == nil {
+		return
+	}
+	if updatedAt.IsZero() {
+		updatedAt = time.Now()
+	}
+	cfg.AutoUpdateLastAttemptAt = updatedAt
+	cfg.LastUpdatedAt = updatedAt
+	cfg.LastNodeCount = result.NodeCount
+	cfg.LastAdded = result.AddedCount
+	cfg.LastUpdated = result.UpdatedCount
+	cfg.LastRemoved = result.RemovedCount
+	cfg.LastSubscriptionUploadBytes = result.SubscriptionUploadBytes
+	cfg.LastSubscriptionDownloadBytes = result.SubscriptionDownloadBytes
+	cfg.LastSubscriptionTotalBytes = result.SubscriptionTotalBytes
+	if result.SubscriptionExpireAt != nil {
+		cfg.LastSubscriptionExpireAt = result.SubscriptionExpireAt.UTC()
+	} else {
+		cfg.LastSubscriptionExpireAt = time.Time{}
+	}
+	cfg.LastError = ""
+}
+
 func (h *ProxyOutboundHandler) toSubscriptionDTO(cfg *config.ProxySubscription) ProxySubscriptionDTO {
 	dto := ProxySubscriptionDTO{
-		ID:            cfg.ID,
-		Name:          cfg.Name,
-		URL:           cfg.URL,
-		Enabled:       cfg.Enabled,
-		Group:         cfg.Group,
-		ProxyName:     cfg.ProxyName,
-		UserAgent:     cfg.UserAgent,
-		LastNodeCount: cfg.LastNodeCount,
-		LastAdded:     cfg.LastAdded,
-		LastUpdated:   cfg.LastUpdated,
-		LastRemoved:   cfg.LastRemoved,
-		LastError:     cfg.LastError,
+		ID:                            cfg.ID,
+		Name:                          cfg.Name,
+		URL:                           cfg.URL,
+		Enabled:                       cfg.Enabled,
+		Group:                         cfg.Group,
+		ProxyName:                     cfg.ProxyName,
+		UserAgent:                     cfg.UserAgent,
+		AutoUpdateEnabled:             cfg.IsAutoUpdateEnabled(),
+		AutoUpdateMode:                cfg.GetAutoUpdateMode(),
+		AutoUpdateTime:                cfg.GetAutoUpdateTime(),
+		AutoUpdateIntervalDays:        cfg.GetAutoUpdateIntervalDays(),
+		LastNodeCount:                 cfg.LastNodeCount,
+		LastAdded:                     cfg.LastAdded,
+		LastUpdated:                   cfg.LastUpdated,
+		LastRemoved:                   cfg.LastRemoved,
+		LastSubscriptionUploadBytes:   cfg.LastSubscriptionUploadBytes,
+		LastSubscriptionDownloadBytes: cfg.LastSubscriptionDownloadBytes,
+		LastSubscriptionTotalBytes:    cfg.LastSubscriptionTotalBytes,
+		LastError:                     cfg.LastError,
 	}
 	if !cfg.LastUpdatedAt.IsZero() {
 		dto.LastUpdatedAt = cfg.LastUpdatedAt.Format(time.RFC3339)
+	}
+	if !cfg.LastSubscriptionExpireAt.IsZero() {
+		dto.LastSubscriptionExpireAt = cfg.LastSubscriptionExpireAt.Format(time.RFC3339)
 	}
 	return dto
 }
@@ -701,6 +779,7 @@ func (h *ProxyOutboundHandler) CreateProxySubscription(c *gin.Context) {
 	if cfg.ID == "" {
 		cfg.ID = uuid.NewString()
 	}
+	markProxySubscriptionManualSave(cfg, time.Now())
 	if err := h.subConfigMgr.AddSubscription(cfg); err != nil {
 		respondError(c, http.StatusBadRequest, "Failed to create proxy subscription", err.Error())
 		return
@@ -732,6 +811,7 @@ func (h *ProxyOutboundHandler) UpdateProxySubscription(c *gin.Context) {
 	if cfg.ID == "" {
 		cfg.ID = id
 	}
+	markProxySubscriptionManualSave(cfg, time.Now())
 	if err := h.subConfigMgr.UpdateSubscription(id, cfg); err != nil {
 		respondError(c, http.StatusBadRequest, "Failed to update proxy subscription", err.Error())
 		return
@@ -802,18 +882,15 @@ func (h *ProxyOutboundHandler) UpdateProxySubscriptionNow(c *gin.Context) {
 		return
 	}
 	result, err := h.subService.UpdateSubscription(c.Request.Context(), effectiveSub)
+	now := time.Now()
 	if err != nil {
+		sub.AutoUpdateLastAttemptAt = now
 		sub.LastError = err.Error()
 		_ = h.subConfigMgr.UpdateSubscription(sub.ID, sub)
 		respondError(c, http.StatusBadGateway, "Failed to update proxy subscription", err.Error())
 		return
 	}
-	sub.LastUpdatedAt = time.Now()
-	sub.LastNodeCount = result.NodeCount
-	sub.LastAdded = result.AddedCount
-	sub.LastUpdated = result.UpdatedCount
-	sub.LastRemoved = result.RemovedCount
-	sub.LastError = ""
+	applyProxySubscriptionUpdateResult(sub, result, now)
 	if err := h.subConfigMgr.UpdateSubscription(sub.ID, sub); err != nil {
 		respondError(c, http.StatusInternalServerError, "Failed to persist proxy subscription state", err.Error())
 		return
@@ -852,8 +929,10 @@ func (h *ProxyOutboundHandler) UpdateAllProxySubscriptions(c *gin.Context) {
 			continue
 		}
 		effectiveSub, err := updateReq.applyTo(sub)
+		now := time.Now()
 		if err != nil {
 			failed++
+			sub.AutoUpdateLastAttemptAt = now
 			sub.LastError = err.Error()
 			_ = h.subConfigMgr.UpdateSubscription(sub.ID, sub)
 			items = append(items, itemResult{Subscription: h.toSubscriptionDTO(sub), Error: err.Error()})
@@ -862,18 +941,14 @@ func (h *ProxyOutboundHandler) UpdateAllProxySubscriptions(c *gin.Context) {
 		result, err := h.subService.UpdateSubscription(c.Request.Context(), effectiveSub)
 		if err != nil {
 			failed++
+			sub.AutoUpdateLastAttemptAt = now
 			sub.LastError = err.Error()
 			_ = h.subConfigMgr.UpdateSubscription(sub.ID, sub)
 			items = append(items, itemResult{Subscription: h.toSubscriptionDTO(sub), Error: err.Error()})
 			continue
 		}
 		updated++
-		sub.LastUpdatedAt = time.Now()
-		sub.LastNodeCount = result.NodeCount
-		sub.LastAdded = result.AddedCount
-		sub.LastUpdated = result.UpdatedCount
-		sub.LastRemoved = result.RemovedCount
-		sub.LastError = ""
+		applyProxySubscriptionUpdateResult(sub, result, now)
 		_ = h.subConfigMgr.UpdateSubscription(sub.ID, sub)
 		items = append(items, itemResult{Subscription: h.toSubscriptionDTO(sub), Result: result})
 	}
@@ -1995,7 +2070,7 @@ func (h *ProxyOutboundHandler) BatchBlockProxyOutboundAutoSelectByBody(c *gin.Co
 		return
 	}
 	respondSuccess(c, map[string]interface{}{
-		"updated":  updated,
+		"updated":   updated,
 		"outbounds": items,
 	})
 }
@@ -2014,7 +2089,7 @@ func (h *ProxyOutboundHandler) BatchUnblockProxyOutboundAutoSelectByBody(c *gin.
 		return
 	}
 	respondSuccess(c, map[string]interface{}{
-		"updated":  updated,
+		"updated":   updated,
 		"outbounds": items,
 	})
 }

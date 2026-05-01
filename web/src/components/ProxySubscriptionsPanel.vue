@@ -281,7 +281,7 @@ const createDefaultForm = () => ({
   group: '',
   proxy_name: null,
   user_agent: 'Mozilla/5.0',
-  auto_update_enabled: true,
+  auto_update_enabled: false,
   auto_update_mode: 'daily',
   auto_update_time: '04:00',
   auto_update_interval_days: 1

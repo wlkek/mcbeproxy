@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strconv"
 	"runtime"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,12 +20,16 @@ import (
 	"mcpeserverproxy/internal/proxy"
 )
 
+func boolPtrForTest(v bool) *bool {
+	return &v
+}
+
 // mockOutboundManager implements proxy.OutboundManager for testing.
 type mockOutboundManager struct {
 	outbounds map[string]*config.ProxyOutbound
 	latency   map[string]int64
 	history   map[string][]proxy.ServerNodeLatencySample
-	outbound   map[string][]proxy.OutboundLatencySample
+	outbound  map[string][]proxy.OutboundLatencySample
 	selected  map[string]string
 }
 
@@ -256,6 +260,140 @@ func setupTestRouter(handler *ProxyOutboundHandler) *gin.Engine {
 	router.GET("/api/proxy-outbounds/groups/:name", handler.GetGroup)
 	router.POST("/api/proxy-outbounds/parse-import", handler.ParseImportContent)
 	return router
+}
+
+func TestCreateProxySubscriptionSaveDoesNotLeaveAutoUpdateImmediatelyDue(t *testing.T) {
+	dir := t.TempDir()
+	configMgr := config.NewProxyOutboundConfigManager(filepath.Join(dir, "proxy_outbounds.json"))
+	subConfigMgr := config.NewProxySubscriptionConfigManager(filepath.Join(dir, "proxy_subscriptions.json"))
+	handler := NewProxyOutboundHandler(configMgr, subConfigMgr, nil, newMockOutboundManager())
+	router := gin.New()
+	router.POST("/api/proxy-subscriptions", handler.CreateProxySubscription)
+	var fetchCalls int32
+	subscriptionServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fetchCalls, 1)
+		_, _ = w.Write([]byte("ss://example"))
+	}))
+	defer subscriptionServer.Close()
+
+	payload, err := json.Marshal(ProxySubscriptionRequest{
+		Name:                   "Once",
+		URL:                    subscriptionServer.URL + "/once",
+		Enabled:                boolPtrForTest(true),
+		AutoUpdateEnabled:      boolPtrForTest(true),
+		AutoUpdateMode:         config.ProxySubscriptionAutoUpdateModeDaily,
+		AutoUpdateTime:         "00:00",
+		AutoUpdateIntervalDays: 1,
+	})
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/proxy-subscriptions", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := atomic.LoadInt32(&fetchCalls); got != 0 {
+		t.Fatalf("save must not fetch subscription URL, got %d request(s)", got)
+	}
+	subs := subConfigMgr.GetAllSubscriptions()
+	if len(subs) != 1 {
+		t.Fatalf("expected one subscription, got %d", len(subs))
+	}
+	sub := subs[0]
+	if sub.AutoUpdateEnabled == nil || !*sub.AutoUpdateEnabled {
+		t.Fatal("expected auto update enabled to be persisted")
+	}
+	if sub.GetAutoUpdateMode() != config.ProxySubscriptionAutoUpdateModeDaily {
+		t.Fatalf("auto update mode = %q", sub.GetAutoUpdateMode())
+	}
+	if sub.GetAutoUpdateTime() != "00:00" {
+		t.Fatalf("auto update time = %q", sub.GetAutoUpdateTime())
+	}
+	if sub.AutoUpdateLastAttemptAt.IsZero() {
+		t.Fatal("expected manual save to set auto update last attempt baseline")
+	}
+	scheduledAt := time.Date(sub.AutoUpdateLastAttemptAt.Year(), sub.AutoUpdateLastAttemptAt.Month(), sub.AutoUpdateLastAttemptAt.Day(), 0, 0, 0, 0, sub.AutoUpdateLastAttemptAt.Location())
+	if sub.AutoUpdateLastAttemptAt.Before(scheduledAt) {
+		t.Fatalf("manual save baseline %s is before scheduled time %s", sub.AutoUpdateLastAttemptAt, scheduledAt)
+	}
+}
+
+func TestUpdateProxySubscriptionPreservesAutoUpdateFieldsAndSetsManualSaveBaseline(t *testing.T) {
+	dir := t.TempDir()
+	configMgr := config.NewProxyOutboundConfigManager(filepath.Join(dir, "proxy_outbounds.json"))
+	subConfigMgr := config.NewProxySubscriptionConfigManager(filepath.Join(dir, "proxy_subscriptions.json"))
+	var fetchCalls int32
+	subscriptionServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fetchCalls, 1)
+		_, _ = w.Write([]byte("ss://example"))
+	}))
+	defer subscriptionServer.Close()
+	oldAttempt := time.Now().Add(-48 * time.Hour)
+	if err := subConfigMgr.AddSubscription(&config.ProxySubscription{
+		ID:                      "sub-1",
+		Name:                    "Once",
+		URL:                     subscriptionServer.URL + "/once",
+		Enabled:                 true,
+		AutoUpdateEnabled:       boolPtrForTest(false),
+		AutoUpdateMode:          config.ProxySubscriptionAutoUpdateModeInterval,
+		AutoUpdateIntervalDays:  7,
+		AutoUpdateLastAttemptAt: oldAttempt,
+		LastNodeCount:           12,
+	}); err != nil {
+		t.Fatalf("AddSubscription failed: %v", err)
+	}
+	handler := NewProxyOutboundHandler(configMgr, subConfigMgr, nil, newMockOutboundManager())
+	router := gin.New()
+	router.PUT("/api/proxy-subscriptions/:id", handler.UpdateProxySubscription)
+
+	payload, err := json.Marshal(ProxySubscriptionRequest{
+		Name:                   "Once Renamed",
+		URL:                    subscriptionServer.URL + "/once-new",
+		Enabled:                boolPtrForTest(true),
+		AutoUpdateEnabled:      boolPtrForTest(true),
+		AutoUpdateMode:         config.ProxySubscriptionAutoUpdateModeDaily,
+		AutoUpdateTime:         "00:00",
+		AutoUpdateIntervalDays: 1,
+	})
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/proxy-subscriptions/sub-1", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := atomic.LoadInt32(&fetchCalls); got != 0 {
+		t.Fatalf("save must not fetch subscription URL, got %d request(s)", got)
+	}
+	updated, ok := subConfigMgr.GetSubscription("sub-1")
+	if !ok {
+		t.Fatal("expected updated subscription")
+	}
+	if updated.Name != "Once Renamed" {
+		t.Fatalf("name = %q", updated.Name)
+	}
+	if updated.AutoUpdateEnabled == nil || !*updated.AutoUpdateEnabled {
+		t.Fatal("expected auto update enabled to be persisted")
+	}
+	if updated.GetAutoUpdateMode() != config.ProxySubscriptionAutoUpdateModeDaily {
+		t.Fatalf("auto update mode = %q", updated.GetAutoUpdateMode())
+	}
+	if updated.LastNodeCount != 12 {
+		t.Fatalf("last node count = %d, want 12", updated.LastNodeCount)
+	}
+	if !updated.AutoUpdateLastAttemptAt.After(oldAttempt) {
+		t.Fatalf("expected manual save baseline to advance, got %s <= %s", updated.AutoUpdateLastAttemptAt, oldAttempt)
+	}
 }
 
 func TestGetServerNodeLatencyHistory_Success(t *testing.T) {

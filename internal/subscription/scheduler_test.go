@@ -55,6 +55,27 @@ func TestSubscriptionAutoUpdateDueDaily(t *testing.T) {
 	}
 }
 
+func TestSubscriptionAutoUpdateDueDailySkipsAfterManualSaveBaseline(t *testing.T) {
+	now := time.Date(2026, 4, 18, 12, 30, 0, 0, time.Local)
+	sub := &config.ProxySubscription{
+		ID:                      "sub-1",
+		Name:                    "Daily",
+		URL:                     "https://example.com/sub",
+		Enabled:                 true,
+		AutoUpdateMode:          config.ProxySubscriptionAutoUpdateModeDaily,
+		AutoUpdateTime:          "04:00",
+		AutoUpdateLastAttemptAt: now,
+	}
+
+	due, _, err := subscriptionAutoUpdateDue(sub, now)
+	if err != nil {
+		t.Fatalf("subscriptionAutoUpdateDue returned error: %v", err)
+	}
+	if due {
+		t.Fatal("expected manual save baseline to suppress same-day auto update")
+	}
+}
+
 func TestSubscriptionAutoUpdateDueInterval(t *testing.T) {
 	now := time.Date(2026, 4, 18, 4, 30, 0, 0, time.Local)
 	sub := &config.ProxySubscription{
